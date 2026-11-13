@@ -1,0 +1,1801 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>물체·손 인식 테스트 (서버)</title>
+<!-- QR 코드 라이브러리 (cdnjs, 버전 고정) -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrious/4.0.2/qrious.min.js"></script>
+<style>
+  /* ===== 색상 토큰 (라이트/다크) ===== */
+  :root {
+    color-scheme: light;
+    --bg: #eef1f5;
+    --surface: #ffffff;
+    --text: #141a24;
+    --muted: #586274;
+    --line: #d3d9e2;
+    --accent: #2f6fed;
+    --accent-text: #ffffff;
+    --danger: #a8231a;
+    --danger-bg: #fdecea;
+    --warn: #7a4b00;
+    --warn-bg: #fff4d6;
+    --stage-bg: #000000;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      color-scheme: dark;
+      --bg: #10141b;
+      --surface: #1a2029;
+      --text: #e9eef6;
+      --muted: #97a2b4;
+      --line: #2c3442;
+      --accent: #6b9bff;
+      --accent-text: #0a1426;
+      --danger: #ff9b91;
+      --danger-bg: #3b1714;
+      --warn: #ffd27a;
+      --warn-bg: #3a2c0c;
+    }
+  }
+
+  * { box-sizing: border-box; }
+  /* hidden 속성이 display 지정에 덮이지 않도록 (안내 문구·설정 칸 숨기기) */
+  [hidden] { display: none !important; }
+  /* 개발자 화면(#dev)에서만 보이는 요소 */
+  body:not(.dev) .dev-only { display: none !important; }
+  html, body { margin: 0; }
+  body {
+    min-height: 100%;
+    background: var(--bg);
+    color: var(--text);
+    font-family: system-ui, -apple-system, "Noto Sans KR", "Apple SD Gothic Neo", "Malgun Gothic", sans-serif;
+    padding: env(safe-area-inset-top, 0px) env(safe-area-inset-right, 0px)
+             env(safe-area-inset-bottom, 0px) env(safe-area-inset-left, 0px);
+  }
+
+  /* ===== 브라우저 안내 ===== */
+  .banner {
+    margin: 8px 8px 0;
+    padding: 8px 12px;
+    border-radius: 8px;
+    background: var(--warn-bg);
+    color: var(--warn);
+    border: 1px solid var(--warn);
+    font-size: 14px;
+    font-weight: 600;
+  }
+
+  /* ===== 상단 상태 표시 ===== */
+  .stats {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 6px;
+    padding: 8px 8px 0;
+  }
+  .stat {
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 4px 8px;
+    min-width: 0;
+  }
+  .stat-label { font-size: 11px; color: var(--muted); white-space: nowrap; }
+  .stat-value {
+    font-size: 17px;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .timing { margin: 4px 8px 0; font-size: 12px; color: var(--muted); word-break: break-word; }
+
+  /* ===== 상태/에러 표시 ===== */
+  #status {
+    margin: 8px 8px 0;
+    padding: 8px 12px;
+    border-radius: 8px;
+    font-size: 14px;
+    background: var(--surface);
+    border: 1px solid var(--line);
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  #status.warn { background: var(--warn-bg); color: var(--warn); border-color: var(--warn); }
+  #status.error { background: var(--danger-bg); color: var(--danger); border-color: var(--danger); }
+
+  /* ===== 서버 설정 ===== */
+  .settings {
+    margin: 8px 8px 0;
+    padding: 10px;
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    display: grid;
+    gap: 8px;
+  }
+  .settings label { display: grid; gap: 4px; font-size: 13px; color: var(--muted); }
+  .settings input, .settings select {
+    font: inherit;
+    font-size: 16px; /* 아이폰 확대 방지 */
+    padding: 9px 10px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background: var(--bg);
+    color: var(--text);
+    width: 100%;
+  }
+  .settings .row { display: grid; grid-template-columns: 2fr 1fr; gap: 8px; }
+
+  /* ===== 카메라 + 캔버스 ===== */
+  /* 영상은 화면 너비에 맞추고, 높이는 영상 비율대로 (페이지는 세로로 스크롤) */
+  .viewport { padding: 8px 0; }
+  .stage {
+    position: relative;
+    width: 100%;
+    aspect-ratio: var(--ar, 1.3333); /* 카메라를 켜기 전에는 4:3 */
+    margin: 0 auto;
+    background: var(--stage-bg);
+    overflow: hidden;
+  }
+  /* 노트북처럼 넓은 화면에서는 화면 높이를 넘지 않게 */
+  @media (min-width: 700px) {
+    .viewport { padding: 8px; }
+    .stage { width: min(100%, calc(80vh * var(--ar, 1.3333))); border-radius: 8px; }
+  }
+  /* 영상과 캔버스는 같은 크기로 겹침. 좌우 반전 없음 */
+  .stage video, .stage canvas {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    display: block;
+  }
+  .stage video { object-fit: fill; }
+  .placeholder {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+    text-align: center;
+    color: #c9d1dd;
+    font-size: 16px;
+  }
+
+  /* ===== 버튼 ===== */
+  /* 버튼은 화면 아래에 붙여서 영상이 길어도 항상 보이게 */
+  .control-bar {
+    position: sticky;
+    bottom: 0;
+    z-index: 5;
+    background: var(--bg);
+    padding: 8px 0 env(safe-area-inset-bottom, 0px);
+  }
+  .controls { display: flex; gap: 8px; padding: 0 8px 8px; }
+  button {
+    flex: 1 1 0;
+    min-height: 50px;
+    font: inherit;
+    font-size: 16px;
+    font-weight: 600;
+    border-radius: 12px;
+    border: 1px solid var(--line);
+    background: var(--surface);
+    color: var(--text);
+  }
+  .controls.secondary button { min-height: 42px; font-size: 14px; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
+  button:disabled { opacity: 0.5; }
+  button:focus-visible, input:focus-visible, select:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+
+  /* ===== 응답 확인 패널 ===== */
+  details.debug {
+    margin: 0 8px 8px;
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 6px 10px;
+    font-size: 14px;
+  }
+  details.debug summary { cursor: pointer; color: var(--muted); }
+  details.debug pre {
+    margin: 6px 0 0;
+    max-height: 22vh;
+    overflow: auto;
+    font-size: 12px;
+    line-height: 1.4;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+
+  /* ===== QR 화면 ===== */
+  .modal {
+    position: fixed;
+    inset: 0;
+    z-index: 20;
+    background: var(--bg);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 12px;
+    padding: calc(16px + env(safe-area-inset-top, 0px)) 16px calc(16px + env(safe-area-inset-bottom, 0px));
+    overflow: auto;
+  }
+  .modal[hidden] { display: none; }
+  #qrCanvas { background: #ffffff; padding: 12px; border-radius: 12px; max-width: 100%; height: auto; }
+  #qrUrl { font-size: 13px; color: var(--muted); max-width: 640px; text-align: center; word-break: break-all; }
+  #qrWarn { max-width: 640px; }
+  .modal button { flex: 0 0 auto; min-width: 200px; }
+</style>
+</head>
+<body>
+
+  <div class="banner" id="browserWarn" hidden></div>
+
+  <div class="stats">
+    <div class="stat"><div class="stat-label">인식 방식</div><div class="stat-value" id="modeVal">–</div></div>
+    <div class="stat"><div class="stat-label">손 인식 FPS</div><div class="stat-value" id="handFpsVal">–</div></div>
+    <div class="stat"><div class="stat-label">물체 갱신/초</div><div class="stat-value" id="objFpsVal">–</div></div>
+    <!-- 서버 요청 단계별 시간 (#dev 에서만 표시): 캡처 → 인코딩 → 요청(서버 처리 + 네트워크) -->
+    <div class="stat dev-only"><div class="stat-label">캡처</div><div class="stat-value" id="captureVal">–</div></div>
+    <div class="stat dev-only"><div class="stat-label" id="encodeLabel">인코딩</div><div class="stat-value" id="encodeVal">–</div></div>
+    <div class="stat dev-only"><div class="stat-label" id="sizeLabel">전송 크기</div><div class="stat-value" id="bytesVal">–</div></div>
+    <div class="stat dev-only"><div class="stat-label">요청</div><div class="stat-value" id="rttVal">–</div></div>
+    <div class="stat dev-only"><div class="stat-label">서버 처리</div><div class="stat-value" id="serverMsVal">–</div></div>
+    <div class="stat dev-only"><div class="stat-label">네트워크</div><div class="stat-value" id="netVal">–</div></div>
+    <div class="stat dev-only"><div class="stat-label">전체 왕복</div><div class="stat-value" id="totalVal">–</div></div>
+    <div class="stat dev-only"><div class="stat-label">요청 간격</div><div class="stat-value" id="intervalVal">–</div></div>
+    <div class="stat dev-only"><div class="stat-label">서버 장치</div><div class="stat-value" id="deviceVal">–</div></div>
+  </div>
+  <div class="timing dev-only" id="timingDetail"></div>
+
+  <div id="status" role="status" aria-live="polite">모델 불러오는 중…</div>
+
+  <section class="settings" id="settings" aria-label="서버 설정">
+    <!-- 서버 주소와 API 키는 #dev 일 때만 표시 -->
+    <label class="dev-only">서버 주소 (비우면 이 페이지 주소)
+      <input id="serverInput" type="url" inputmode="url" placeholder="https://xxxx.trycloudflare.com"
+             autocomplete="off" autocapitalize="off" spellcheck="false">
+    </label>
+    <label class="dev-only">API 키 (X-API-Key)
+      <input id="keyInput" type="text" autocomplete="off" autocapitalize="off" spellcheck="false">
+    </label>
+    <div class="row">
+      <label>찾을 물체 (영어, 쉼표로 여러 개)
+        <input id="targetInput" type="text" value="cup" autocomplete="off" autocapitalize="off" spellcheck="false">
+      </label>
+      <label>전송 이미지
+        <select id="sizeSelect">
+          <option value="320">320px</option>
+          <option value="480">480px</option>
+          <option value="640" selected>640px</option>
+        </select>
+      </label>
+    </div>
+  </section>
+
+  <div class="viewport" id="viewport">
+    <div class="stage" id="stage">
+      <video id="video" playsinline muted autoplay></video>
+      <canvas id="overlay"></canvas>
+      <div class="placeholder" id="placeholder">시작 버튼을 누르면 후면 카메라가 켜집니다</div>
+    </div>
+  </div>
+
+  <div class="control-bar">
+  <div class="controls">
+    <button id="startBtn" class="primary" type="button">시작</button>
+    <button id="describeBtn" type="button">설명 요청</button>
+  </div>
+  <div class="controls secondary">
+    <button id="settingsBtn" type="button" aria-expanded="true" aria-controls="settings">설정 접기</button>
+    <button id="qrBtn" type="button">QR 보기</button>
+    <button id="othersBtn" type="button" aria-pressed="false">다른 물체 보기</button>
+  </div>
+  </div>
+
+  <details class="debug" id="describePanel">
+    <summary>설명 응답 (/describe)</summary>
+    <pre id="describeOut">아직 요청하지 않았습니다</pre>
+  </details>
+  <details class="debug dev-only">
+    <summary>window.latestDetection</summary>
+    <pre id="output">null</pre>
+  </details>
+
+  <div class="modal" id="qrModal" hidden role="dialog" aria-modal="true" aria-label="접속 QR 코드">
+    <div class="banner" id="qrWarn" hidden></div>
+    <canvas id="qrCanvas"></canvas>
+    <div id="qrUrl"></div>
+    <button id="qrCloseBtn" class="primary" type="button">닫기</button>
+  </div>
+
+<script type="module">
+// =====================================================================
+// 설정값
+// =====================================================================
+const MP_VERSION = "0.10.14"; // @mediapipe/tasks-vision 버전 고정
+const MP_BUNDLE_URL = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MP_VERSION}/vision_bundle.mjs`;
+const MP_WASM_URL = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MP_VERSION}/wasm`;
+
+const OBJECT_MODEL_URL =
+  "https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/float16/1/efficientdet_lite0.tflite";
+const HAND_MODEL_URL =
+  "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task";
+
+// 서버 요청
+const SERVER_INTERVAL_MS = 300;       // 기본 요청 간격
+const STABLE_INTERVAL_MS = 1000;      // 손이 없고 물체가 연속으로 확실히 잡혔을 때 간격
+const HAND_HOLD_MS = 500;             // 손이 사라진 뒤에도 이 시간 동안은 "손 있음"으로 봄 (인식이 잠깐 끊겨도 간격이 흔들리지 않게)
+const RATE_LIMIT_INTERVAL_MS = 2000;  // 429를 받았을 때 간격
+const RETRY_INTERVAL_MS = 5000;       // 로컬 모드에서 서버 재연결 시도 간격
+const HIGH_CONF = 0.5;                // "확실히 잡힘" 기준 신뢰도
+const HIGH_CONF_STREAK = 3;           // 몇 번 연속이면 간격을 늘릴지
+const FAIL_LIMIT = 3;                 // 몇 번 연속 실패하면 로컬로 전환할지
+const SLOW_RTT_MS = 1000;             // 느린 응답 기준
+const SLOW_RTT_STREAK = 3;            // 몇 번 연속 느리면 이미지를 줄일지
+const REQUEST_TIMEOUT_MS = 2000;      // /detect 제한 시간
+const JPEG_QUALITY = 0.7;
+const IMAGE_SIZES = [320, 480, 640];  // 선택 가능한 긴 변 크기
+const SERVER_CONF = 0.25;             // 서버에 보내는 최소 신뢰도 (0.5 판단은 이 페이지에서 함)
+
+// 로컬(MediaPipe) 물체 인식
+const LOCAL_INTERVAL_MS = 300;
+const LOCAL_SCORE_THRESHOLD = 0.3;
+const LOCAL_MAX_RESULTS = 10;
+
+// VLM 설명 요청
+const DESCRIBE_PAD = 0.2;             // 박스 사방 여유 비율
+const DESCRIBE_MAX_SIDE = 1024;       // 잘라낸 이미지의 최대 긴 변
+const DESCRIBE_JPEG_QUALITY = 0.85;
+const DESCRIBE_TIMEOUT_MS = 20000;
+const GRASP_SHOW_MS = 10000;          // 잡을 위치 점을 표시하는 시간
+
+// MediaPipe EfficientDet(COCO) 기본 80종 라벨
+const COCO_LABELS = new Set([
+  "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck", "boat", "traffic light",
+  "fire hydrant", "stop sign", "parking meter", "bench", "bird", "cat", "dog", "horse", "sheep", "cow",
+  "elephant", "bear", "zebra", "giraffe", "backpack", "umbrella", "handbag", "tie", "suitcase", "frisbee",
+  "skis", "snowboard", "sports ball", "kite", "baseball bat", "baseball glove", "skateboard", "surfboard",
+  "tennis racket", "bottle", "wine glass", "cup", "fork", "knife", "spoon", "bowl", "banana", "apple",
+  "sandwich", "orange", "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", "chair", "couch",
+  "potted plant", "bed", "dining table", "toilet", "tv", "laptop", "mouse", "remote", "keyboard",
+  "cell phone", "microwave", "oven", "toaster", "sink", "refrigerator", "book", "clock", "vase",
+  "scissors", "teddy bear", "hair drier", "toothbrush",
+]);
+
+// 손 21개 관절 연결 정보 (MediaPipe 표준)
+const HAND_CONNECTIONS = [
+  [0, 1], [1, 2], [2, 3], [3, 4],
+  [0, 5], [5, 6], [6, 7], [7, 8],
+  [5, 9], [9, 10], [10, 11], [11, 12],
+  [9, 13], [13, 14], [14, 15], [15, 16],
+  [13, 17], [17, 18], [18, 19], [19, 20],
+  [0, 17],
+];
+
+// 캔버스 색상 (영상 위에 그리므로 테마와 무관하게 고정)
+const COLOR_TARGET = "#ffc93c";
+const COLOR_OTHER = "#ffffff";
+const COLOR_HAND_LINE = "#4fd1e8";
+const COLOR_HAND_POINT = "#ffffff";
+const COLOR_INDEX_TIP = "#ff4fa3";
+const COLOR_GRASP = "#3ee07a";
+const COLOR_DISCONNECT = "#e5484d";
+
+// =====================================================================
+// DOM 요소
+// =====================================================================
+const $ = (id) => document.getElementById(id);
+const els = {
+  video: $("video"), canvas: $("overlay"), stage: $("stage"), viewport: $("viewport"),
+  placeholder: $("placeholder"), status: $("status"), browserWarn: $("browserWarn"),
+  settings: $("settings"), serverInput: $("serverInput"), keyInput: $("keyInput"),
+  targetInput: $("targetInput"), sizeSelect: $("sizeSelect"),
+  startBtn: $("startBtn"), describeBtn: $("describeBtn"), settingsBtn: $("settingsBtn"),
+  qrBtn: $("qrBtn"), othersBtn: $("othersBtn"),
+  modeVal: $("modeVal"), handFpsVal: $("handFpsVal"), objFpsVal: $("objFpsVal"),
+  rttVal: $("rttVal"), serverMsVal: $("serverMsVal"), netVal: $("netVal"),
+  intervalVal: $("intervalVal"), deviceVal: $("deviceVal"),
+  captureVal: $("captureVal"), encodeVal: $("encodeVal"), bytesVal: $("bytesVal"), sizeLabel: $("sizeLabel"),
+  totalVal: $("totalVal"), encodeLabel: $("encodeLabel"),
+  timingDetail: $("timingDetail"), output: $("output"),
+  describePanel: $("describePanel"), describeOut: $("describeOut"),
+  qrModal: $("qrModal"), qrCanvas: $("qrCanvas"), qrUrl: $("qrUrl"), qrWarn: $("qrWarn"), qrCloseBtn: $("qrCloseBtn"),
+};
+const ctx = els.canvas.getContext("2d");
+
+// =====================================================================
+// 상태
+// =====================================================================
+// 화면 입력값 (브라우저 저장소에는 저장하지 않음)
+const cfg = { server: "", key: "", targets: ["cup"], imgSize: 640 };
+let cfgVersion = 0; // 설정이 바뀌면 증가. 이전 설정으로 보낸 요청의 응답은 버림
+
+let fileset = null;
+let modelsPromise = null;
+let objectModelError = "";
+const models = {
+  hand: { name: "손 인식", task: null, delegate: null, Class: null, options: null, switching: false },
+  object: { name: "로컬 물체 인식", task: null, delegate: null, Class: null, options: null, switching: false },
+};
+
+let stream = null;
+let running = false;
+let starting = false;
+let sessionId = 0; // 시작/정지할 때마다 증가. 이전 세션의 응답은 버림
+let rafId = null;
+let lastVideoTime = -1;
+let lastLocalRunAt = -Infinity;
+
+// 서버 통신 상태
+const srv = {
+  mode: "server",      // "server" 또는 "local"
+  inFlight: false,     // 응답 대기 중이면 새 요청을 보내지 않음
+  lastStartedAt: -Infinity, // 마지막 요청을 시작한 시각 (다음 요청 = 이 시각 + 현재 간격)
+  handSeenAt: -Infinity,    // 손이 마지막으로 보인 시각
+  failCount: 0,        // 연속 실패 횟수
+  hitStreak: 0,        // 연속으로 높은 신뢰도로 잡힌 횟수
+  rateLimited: false,  // 429를 받은 상태
+  slowCount: 0,        // 연속으로 느린 응답 횟수
+  localOnce: false,    // 503: 이번 주기만 로컬 인식 사용
+  lastCaptureMs: null, // 캡처: 영상 프레임을 캔버스에 그리는 시간
+  lastEncodeMs: null,  // 인코딩: JPEG 변환 시간 (워커/OffscreenCanvas/toDataURL)
+  lastBytes: null,     // 전송 크기: 보낸 이미지 용량(바이트)
+  lastRtt: null,       // 요청: fetch 시작부터 응답 본문까지 받은 시간
+  lastServerMs: null,  // 서버 처리: timing_ms.total
+  lastNetMs: null,     // 네트워크: 요청 - 서버 처리
+  lastTotalMs: null,   // 전체 왕복: 캡처 + 인코딩 + 요청
+  timingDetail: "",
+  device: "",
+  model: "",
+};
+
+// 마지막 물체 결과 (다음 결과가 오기 전까지 유지)
+let lastResult = emptyResult("server");
+
+const fps = { hand: { count: 0, value: 0 }, object: { count: 0, value: 0 }, windowStart: 0 };
+
+let showOthers = false;     // 로컬 모드에서 찾는 물체가 아닌 것도 흐리게 표시
+let describeInFlight = false;
+let graspMark = null;       // { x, y, until } 잡을 위치 표시
+let lastDebugUpdate = 0;
+let callbackErrorShown = false;
+let speechUnlocked = false;
+let koVoice = null;
+
+window.latestDetection = null;
+
+function emptyResult(source) {
+  return { target: null, best: null, detections: [], others: [], capturedAt: 0, source };
+}
+
+// =====================================================================
+// 상태/에러 표시
+// =====================================================================
+// kind: info / warn / error, tag: 누가 띄운 메시지인지 (서버 메시지만 골라서 지우기 위함)
+function setStatus(text, kind = "info", tag = "") {
+  els.status.classList.remove("warn", "error");
+  if (kind !== "info") els.status.classList.add(kind);
+  els.status.dataset.tag = tag;
+  els.status.textContent = text;
+}
+
+function errorText(err) {
+  if (!err) return "알 수 없는 오류";
+  if (typeof err === "string") return err;
+  const name = err.name && err.name !== "Error" ? `${err.name}: ` : "";
+  return `${name}${err.message || String(err)}`;
+}
+
+function showError(err, prefix = "") {
+  console.error(prefix, err);
+  setStatus(`오류: ${prefix}${errorText(err)}`, "error");
+}
+
+window.addEventListener("error", (e) => showError(e.error || e.message));
+window.addEventListener("unhandledrejection", (e) => showError(e.reason));
+
+// =====================================================================
+// 브라우저 확인: 크롬이 아니거나 필요한 기능이 없으면 안내
+// =====================================================================
+function checkBrowser() {
+  const missing = [];
+  if (!window.isSecureContext) missing.push("HTTPS 연결");
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) missing.push("카메라");
+  if (typeof WebAssembly !== "object") missing.push("WebAssembly");
+  if (!window.fetch || !window.AbortController || !window.FormData) missing.push("서버 통신");
+  if (!("speechSynthesis" in window)) missing.push("음성 합성");
+
+  const ua = navigator.userAgent;
+  const brands = (navigator.userAgentData && navigator.userAgentData.brands || []).map((b) => b.brand);
+  // 카카오톡·인스타그램 등 앱 안 브라우저는 크롬이 아님
+  const inApp = /KAKAOTALK|Instagram|FBAN|FBAV|NAVER|Line\/|; wv\)/i.test(ua);
+  let isChrome;
+  if (brands.length) isChrome = brands.includes("Google Chrome");
+  else isChrome = /CriOS/.test(ua) || (/Chrome\/\d+/.test(ua) && !/Edg|OPR|SamsungBrowser|Whale|YaBrowser/.test(ua));
+  if (inApp) isChrome = false;
+
+  if (isChrome && missing.length === 0) return;
+  let msg = "크롬 사용 권장.";
+  if (inApp) msg += " 앱 안에서 열렸다면 메뉴에서 '다른 브라우저로 열기'를 눌러 주세요.";
+  if (missing.length) msg += ` 이 브라우저에서 사용할 수 없는 기능: ${missing.join(", ")}`;
+  els.browserWarn.textContent = msg;
+  els.browserWarn.hidden = false;
+}
+
+// =====================================================================
+// 설정 입력 (URL # 뒤 값으로 자동 입력)
+// =====================================================================
+function normalizeServer(v) {
+  let s = (v || "").trim().replace(/\/+$/, "");
+  if (s && !/^https?:\/\//i.test(s)) s = `https://${s}`;
+  // 서버 주소를 비워두면, 이 페이지를 제공한 서버(같은 주소)를 사용
+  if (!s && /^https?:$/.test(location.protocol)) s = location.origin;
+  return s;
+}
+
+function parseTargets(v) {
+  const list = (v || "").split(",").map((t) => t.trim().toLowerCase()).filter(Boolean);
+  const unique = [...new Set(list)];
+  return unique.length ? unique : ["cup"];
+}
+
+function readConfig() {
+  const before = `${cfg.server}|${cfg.key}|${cfg.targets.join(",")}`;
+  cfg.server = normalizeServer(els.serverInput.value);
+  cfg.key = els.keyInput.value.trim();
+  cfg.targets = parseTargets(els.targetInput.value);
+  const size = Number(els.sizeSelect.value);
+  cfg.imgSize = IMAGE_SIZES.includes(size) ? size : 640;
+  const after = `${cfg.server}|${cfg.key}|${cfg.targets.join(",")}`;
+
+  if (before !== after) {
+    cfgVersion++;
+    resetObjectState();
+  }
+  // HTTPS 페이지에서는 http 서버에 요청할 수 없음 (혼합 콘텐츠 차단)
+  if (location.protocol === "https:" && /^http:\/\//i.test(cfg.server) && !/^http:\/\/(localhost|127\.0\.0\.1)/i.test(cfg.server)) {
+    setStatus("HTTPS 페이지에서는 http:// 서버에 연결할 수 없습니다. 서버 주소를 https://로 바꿔 주세요", "warn", "server");
+  }
+  renderStats();
+}
+
+// 주소 # 뒤에 dev가 있으면 개발자 화면 (서버 주소·API 키 입력칸, 상세 통계 표시)
+let devMode = false;
+
+// 관객 화면에서 API 키가 없을 때 안내 문구
+function missingKeyNotice() {
+  return !devMode && !cfg.key ? "API 키가 없습니다. 발표 화면의 QR 코드를 다시 찍어서 접속해 주세요." : "";
+}
+
+function applyHash() {
+  const p = new URLSearchParams(location.hash.replace(/^#/, ""));
+  devMode = p.has("dev"); // #dev, #key=...&dev 모두 인식
+  document.body.classList.toggle("dev", devMode);
+  if (p.has("server")) els.serverInput.value = p.get("server");
+  if (p.has("key")) els.keyInput.value = p.get("key");
+  if (p.has("target")) els.targetInput.value = p.get("target");
+  if (p.has("size") && IMAGE_SIZES.includes(Number(p.get("size")))) els.sizeSelect.value = p.get("size");
+  // 서버 주소는 비어 있으면 같은 주소를 쓰므로, 키와 물체만 있어도 설정 칸을 접음
+  const complete = Boolean(p.get("key") && p.get("target"));
+  setSettingsOpen(!complete);
+  readConfig();
+  const notice = missingKeyNotice();
+  if (notice) setStatus(notice, "warn");
+}
+
+function setSettingsOpen(open) {
+  els.settings.hidden = !open;
+  els.settingsBtn.setAttribute("aria-expanded", String(open));
+  els.settingsBtn.textContent = open ? "설정 접기" : "설정";
+}
+
+// 설정이 바뀌거나 새로 시작할 때 물체 인식 상태 초기화
+function resetObjectState() {
+  srv.mode = cfg.server ? "server" : "local";
+  srv.lastStartedAt = -Infinity;
+  srv.failCount = 0;
+  srv.hitStreak = 0;
+  srv.rateLimited = false;
+  srv.slowCount = 0;
+  srv.localOnce = false;
+  lastResult = emptyResult(srv.mode);
+  lastLocalRunAt = -Infinity;
+  if (els.status.dataset.tag === "server") setStatus(running ? "인식 중" : "설정을 바꿨습니다");
+  if (running && srv.mode === "local") showLocalModeStatus("서버 주소가 없어 로컬 인식을 사용합니다");
+}
+
+// =====================================================================
+// 모델 로딩 (GPU 시도 → 실패 시 CPU)
+// =====================================================================
+async function createTask(model, delegates = ["GPU", "CPU"]) {
+  let lastErr = null;
+  for (const delegate of delegates) {
+    try {
+      model.task = await model.Class.createFromOptions(fileset, {
+        ...model.options,
+        baseOptions: { ...model.options.baseOptions, delegate },
+      });
+      model.delegate = delegate;
+      return;
+    } catch (err) {
+      lastErr = err;
+      console.warn(`${model.name}: ${delegate} 생성 실패`, err);
+    }
+  }
+  throw new Error(`${model.name} 모델 생성 실패 (${errorText(lastErr)})`);
+}
+
+async function loadModels() {
+  setStatus("모델 불러오는 중…");
+  const vision = await import(MP_BUNDLE_URL);
+  fileset = await vision.FilesetResolver.forVisionTasks(MP_WASM_URL);
+
+  models.hand.Class = vision.HandLandmarker;
+  models.hand.options = {
+    baseOptions: { modelAssetPath: HAND_MODEL_URL },
+    runningMode: "VIDEO",
+    numHands: 1,
+  };
+  models.object.Class = vision.ObjectDetector;
+  models.object.options = {
+    baseOptions: { modelAssetPath: OBJECT_MODEL_URL },
+    runningMode: "VIDEO",
+    scoreThreshold: LOCAL_SCORE_THRESHOLD,
+    maxResults: LOCAL_MAX_RESULTS,
+  };
+
+  // 손 인식은 필수, 로컬 물체 인식은 대체용이라 실패해도 계속 진행
+  const [hand, object] = await Promise.allSettled([createTask(models.hand), createTask(models.object)]);
+  if (hand.status === "rejected") throw hand.reason;
+  objectModelError = object.status === "rejected" ? errorText(object.reason) : "";
+  renderStats();
+}
+
+function ensureModels() {
+  if (!modelsPromise) {
+    modelsPromise = loadModels().catch((err) => {
+      modelsPromise = null; // 다음에 시작 버튼을 누르면 다시 시도
+      throw err;
+    });
+  }
+  return modelsPromise;
+}
+
+// 실행 중 GPU 오류가 나면 해당 모델만 CPU로 다시 생성
+function handleRuntimeError(kind, err) {
+  const model = models[kind];
+  if (model.delegate === "GPU" && !model.switching) {
+    console.warn(`${model.name}: GPU 실행 오류 → CPU로 전환`, err);
+    model.switching = true;
+    const old = model.task;
+    model.task = null;
+    try { old && old.close(); } catch (_) { /* 무시 */ }
+    createTask(model, ["CPU"])
+      .then(() => {
+        model.switching = false;
+        renderStats();
+        setStatus(`${model.name}: GPU 실행 오류로 CPU로 전환했습니다`, "warn");
+      })
+      .catch((e) => {
+        model.switching = false;
+        if (kind === "hand") { stop(); showError(e); }
+        else { objectModelError = errorText(e); showError(e); }
+      });
+    return;
+  }
+  if (kind === "hand") {
+    stop();
+    showError(err, `${model.name} 실행 중 `);
+  } else {
+    // 로컬 물체 인식은 대체용이므로 끄고 계속 진행
+    try { model.task && model.task.close(); } catch (_) { /* 무시 */ }
+    model.task = null;
+    objectModelError = errorText(err);
+    showError(err, `${model.name} 실행 중 (로컬 물체 인식 중단) `);
+  }
+}
+
+// =====================================================================
+// 카메라 시작/정지
+// =====================================================================
+async function start() {
+  starting = true;
+  els.startBtn.disabled = true;
+  unlockSpeech();
+  try {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      throw new Error("카메라를 사용할 수 없습니다. HTTPS 또는 localhost 주소로 열었는지 확인하세요.");
+    }
+    // 사용자 클릭 직후 바로 카메라 요청 (모바일 정책)
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: false,
+      video: { facingMode: { ideal: "environment" }, width: { ideal: 1280 }, height: { ideal: 720 } },
+    });
+    els.video.srcObject = stream;
+    await els.video.play();
+    els.placeholder.hidden = true;
+    fitStage();
+
+    if (!models.hand.task) setStatus("모델 불러오는 중…");
+    await ensureModels();
+
+    sessionId++;
+    readConfig();
+    resetObjectState();
+    srv.inFlight = false;
+    lastVideoTime = -1;
+    fps.hand.count = fps.object.count = 0;
+    fps.hand.value = fps.object.value = 0;
+    fps.windowStart = performance.now();
+
+    running = true;
+    els.startBtn.textContent = "정지";
+    if (srv.mode === "local") showLocalModeStatus("서버 주소가 없어 로컬 인식을 사용합니다");
+    else setStatus(objectModelError ? `인식 중 (로컬 대체 모델 없음: ${objectModelError})` : "인식 중", objectModelError ? "warn" : "info");
+    if (missingKeyNotice()) setStatus(missingKeyNotice(), "warn", "server");
+    rafId = requestAnimationFrame(loop);
+  } catch (err) {
+    stop();
+    showError(err, "시작 실패 - ");
+  } finally {
+    starting = false;
+    els.startBtn.disabled = false;
+  }
+}
+
+function stop() {
+  running = false;
+  sessionId++; // 진행 중인 서버 응답은 무시됨
+  srv.inFlight = false;
+  if (rafId) cancelAnimationFrame(rafId);
+  rafId = null;
+  if (stream) stream.getTracks().forEach((t) => t.stop());
+  stream = null;
+  els.video.srcObject = null;
+  els.placeholder.hidden = false;
+  ctx.clearRect(0, 0, els.canvas.width, els.canvas.height);
+  window.latestDetection = null;
+  els.output.textContent = "null";
+  els.startBtn.textContent = "시작";
+  graspMark = null;
+}
+
+// =====================================================================
+// 화면 크기 맞추기 (스테이지를 영상 비율과 똑같이)
+// =====================================================================
+// 영상 비율을 CSS 변수로 넘겨서, 스테이지를 화면 너비에 맞춘 영상 비율 크기로 만듦
+// (정규화 좌표 0~1이 화면 위 영상 영역과 정확히 일치)
+function fitStage() {
+  const vw = els.video.videoWidth;
+  const vh = els.video.videoHeight;
+  if (vw && vh) els.stage.style.setProperty("--ar", String(vw / vh));
+  else els.stage.style.removeProperty("--ar");
+}
+new ResizeObserver(fitStage).observe(els.viewport);
+els.video.addEventListener("loadedmetadata", fitStage);
+
+// =====================================================================
+// 메인 루프
+// =====================================================================
+function loop() {
+  if (!running) return;
+  rafId = requestAnimationFrame(loop);
+  const video = els.video;
+  if (video.readyState < 2 || !video.videoWidth) return;
+  if (video.currentTime === lastVideoTime) return; // 새 프레임이 아니면 건너뜀
+  lastVideoTime = video.currentTime;
+  try {
+    processFrame(video, performance.now());
+  } catch (err) {
+    stop();
+    showError(err, "프레임 처리 중 ");
+  }
+}
+
+function processFrame(video, now) {
+  const W = video.videoWidth;
+  const H = video.videoHeight;
+  if (els.canvas.width !== W || els.canvas.height !== H) {
+    els.canvas.width = W;
+    els.canvas.height = H;
+    fitStage();
+  }
+
+  // ---- 1) 손 인식: 매 프레임 ----
+  let hand = null;
+  let handLandmarks = null;
+  const hm = models.hand;
+  if (hm.task && !hm.switching) {
+    try {
+      const res = hm.task.detectForVideo(video, now);
+      fps.hand.count++;
+      if (res.landmarks && res.landmarks.length > 0) {
+        handLandmarks = res.landmarks[0];
+        hand = buildHand(handLandmarks);
+        srv.handSeenAt = now;
+      }
+    } catch (err) {
+      handleRuntimeError("hand", err);
+      return;
+    }
+  }
+
+  // ---- 2) 서버 요청: 응답을 기다리지 않고 루프는 계속 ----
+  // 간격은 매 프레임 다시 계산하므로, 1초 간격 중에 손이 나타나면 바로 0.3초 간격으로 바뀜
+  if (cfg.server && !srv.inFlight && now >= srv.lastStartedAt + currentInterval(now)) requestDetect(video);
+
+  // ---- 3) 로컬 인식: 로컬 모드이거나 503을 받은 주기 ----
+  if (srv.localOnce || (srv.mode === "local" && now - lastLocalRunAt >= LOCAL_INTERVAL_MS)) {
+    srv.localOnce = false;
+    runLocal(video, now, W, H);
+  }
+
+  updateFps(now);
+
+  // ---- 4) 출력 데이터 ----
+  const r = lastResult;
+  const detection = {
+    timestamp: now, // performance.now() 기준 ms
+    target: r.target,
+    cup: r.target, // 기존 코드 호환용
+    hand,
+    fps: { hand: fps.hand.value, object: fps.object.value },
+    objectSource: r.source,
+    objectAgeMs: r.capturedAt ? Math.round(now - r.capturedAt) : null,
+  };
+  window.latestDetection = detection;
+
+  if (typeof window.onDetection === "function") {
+    try {
+      window.onDetection(detection);
+    } catch (err) {
+      console.error("onDetection 콜백 오류", err);
+      if (!callbackErrorShown) {
+        callbackErrorShown = true;
+        showError(err, "onDetection 콜백 - ");
+      }
+    }
+  }
+
+  // ---- 5) 그리기 ----
+  draw(handLandmarks, now);
+  updateDebug(detection, now);
+}
+
+// =====================================================================
+// 서버 물체 인식 (POST /detect)
+// =====================================================================
+// 손이 화면에 보이는지 (잠깐 끊긴 경우도 보이는 것으로 침)
+function isHandVisible(now = performance.now()) {
+  return now - srv.handSeenAt <= HAND_HOLD_MS;
+}
+
+// 요청 간격 규칙
+// - 로컬 모드: 5초마다 서버 재연결 시도
+// - 429를 받은 상태: 2초
+// - 손이 없고, 찾는 물체가 연속 3번 확실히(0.5 이상) 잡힘: 1초
+// - 그 외 (손이 보이거나, 물체를 놓쳤거나, 아직 안정적이지 않음): 0.3초
+function currentInterval(now = performance.now()) {
+  if (srv.mode === "local") return RETRY_INTERVAL_MS;
+  if (srv.rateLimited) return RATE_LIMIT_INTERVAL_MS;
+  const stable = srv.hitStreak >= HIGH_CONF_STREAK;
+  return stable && !isHandVisible(now) ? STABLE_INTERVAL_MS : SERVER_INTERVAL_MS;
+}
+
+// =====================================================================
+// JPEG 인코더
+// canvas.toBlob()은 크롬에서 메인 스레드가 한가할 때 인코딩하도록 미뤄짐.
+// 손 인식이 매 프레임 메인 스레드를 쓰면 한가한 때가 없어 수 초씩 지연됨.
+// 그래서 아래 순서로 지원되는 방식을 고르고, 실패하면 다음 방식으로 자동 전환
+//   1) worker    : 프레임을 ImageBitmap으로 워커에 넘겨 OffscreenCanvas.convertToBlob()
+//   2) offscreen : 메인 스레드의 OffscreenCanvas.convertToBlob()
+//   3) dataurl   : canvas.toDataURL()로 바로 변환한 뒤 Blob으로 바꿈
+// =====================================================================
+const ENCODE_TIMEOUT_MS = 2000; // 이 시간 안에 인코딩이 끝나지 않으면 다음 방식으로 전환
+const ENCODER_LABELS = { worker: "워커", offscreen: "Offscreen", dataurl: "toDataURL" };
+
+// 워커 코드 (HTML 파일 하나로 동작하도록 문자열로 넣고 Blob URL로 실행)
+const ENCODER_WORKER_SOURCE = `
+let canvas = null;
+let ctx = null;
+self.onmessage = async (e) => {
+  const { id, bitmap, quality } = e.data;
+  try {
+    if (!canvas) {
+      canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
+      ctx = canvas.getContext("2d");
+      if (!ctx) throw new Error("워커에서 OffscreenCanvas 2d를 사용할 수 없음");
+    }
+    if (canvas.width !== bitmap.width || canvas.height !== bitmap.height) {
+      canvas.width = bitmap.width;
+      canvas.height = bitmap.height;
+    }
+    ctx.drawImage(bitmap, 0, 0);
+    bitmap.close();
+    const blob = await canvas.convertToBlob({ type: "image/jpeg", quality });
+    self.postMessage({ id, blob });
+  } catch (err) {
+    try { bitmap.close(); } catch (_) {}
+    self.postMessage({ id, error: String((err && err.message) || err) });
+  }
+};
+`;
+
+const encoder = {
+  mode: "dataurl",
+  worker: null,
+  pending: new Map(), // 워커 응답을 기다리는 요청들 (id → { resolve, reject, timer })
+  nextId: 1,
+  offscreen: null,    // 메인 스레드에서 프레임을 그리는 OffscreenCanvas
+  offscreenCtx: null,
+  canvas: null,       // OffscreenCanvas가 없을 때 쓰는 일반 캔버스
+  canvasCtx: null,
+};
+
+function supportsOffscreen2d() {
+  try {
+    return typeof OffscreenCanvas !== "undefined"
+      && typeof OffscreenCanvas.prototype.convertToBlob === "function"
+      && Boolean(new OffscreenCanvas(1, 1).getContext("2d"));
+  } catch (_) {
+    return false;
+  }
+}
+
+function initEncoder() {
+  if (supportsOffscreen2d()) {
+    encoder.offscreen = new OffscreenCanvas(1, 1);
+    encoder.offscreenCtx = encoder.offscreen.getContext("2d");
+    const canUseWorker = typeof Worker !== "undefined"
+      && typeof OffscreenCanvas.prototype.transferToImageBitmap === "function";
+    if (canUseWorker) {
+      try {
+        const url = URL.createObjectURL(new Blob([ENCODER_WORKER_SOURCE], { type: "text/javascript" }));
+        encoder.worker = new Worker(url);
+        encoder.worker.onmessage = onEncoderMessage;
+        encoder.worker.onerror = (e) => downgradeEncoder("worker", `워커 오류: ${e.message || "알 수 없음"}`);
+        encoder.mode = "worker";
+        return;
+      } catch (err) {
+        console.warn("인코딩 워커 생성 실패", err);
+      }
+    }
+    encoder.mode = "offscreen";
+    return;
+  }
+  setupCanvasEncoder();
+}
+
+function setupCanvasEncoder() {
+  encoder.canvas = document.createElement("canvas");
+  encoder.canvasCtx = encoder.canvas.getContext("2d");
+  encoder.mode = "dataurl";
+}
+
+// 현재 방식이 실패하면 다음 방식으로 내림 (worker → offscreen → dataurl)
+function downgradeEncoder(fromMode, reason) {
+  if (encoder.mode !== fromMode) return; // 이미 다른 요청이 전환함
+  if (fromMode === "worker") {
+    try { encoder.worker.terminate(); } catch (_) { /* 무시 */ }
+    encoder.worker = null;
+    for (const p of encoder.pending.values()) {
+      clearTimeout(p.timer);
+      p.reject(new Error("인코딩 워커 종료"));
+    }
+    encoder.pending.clear();
+    encoder.mode = "offscreen";
+  } else if (fromMode === "offscreen") {
+    setupCanvasEncoder();
+  } else {
+    return;
+  }
+  console.warn(`JPEG 인코딩 방식 전환: ${fromMode} → ${encoder.mode}`, reason);
+  setStatus(`JPEG 인코딩 방식을 ${ENCODER_LABELS[encoder.mode]}(으)로 바꿨습니다: ${reason}`, "warn");
+  renderStats();
+}
+
+function onEncoderMessage(e) {
+  const { id, blob, error } = e.data || {};
+  const p = encoder.pending.get(id);
+  if (!p) return;
+  clearTimeout(p.timer);
+  encoder.pending.delete(id);
+  if (error) p.reject(new Error(error));
+  else p.resolve(blob);
+}
+
+function encodeInWorker(bitmap, quality) {
+  return new Promise((resolve, reject) => {
+    const id = encoder.nextId++;
+    const timer = setTimeout(() => {
+      encoder.pending.delete(id);
+      reject(new Error(`워커 인코딩 시간 초과 (${ENCODE_TIMEOUT_MS / 1000}초)`));
+    }, ENCODE_TIMEOUT_MS);
+    encoder.pending.set(id, { resolve, reject, timer });
+    encoder.worker.postMessage({ id, bitmap, quality }, [bitmap]); // 복사 없이 넘김
+  });
+}
+
+function withTimeout(promise, ms, message) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(message)), ms);
+    promise.then(
+      (v) => { clearTimeout(timer); resolve(v); },
+      (e) => { clearTimeout(timer); reject(e); }
+    );
+  });
+}
+
+function dataUrlToBlob(dataUrl) {
+  const comma = dataUrl.indexOf(",");
+  const mime = (dataUrl.slice(0, comma).match(/data:([^;]+)/) || [])[1] || "image/jpeg";
+  const binary = atob(dataUrl.slice(comma + 1));
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return new Blob([bytes], { type: mime });
+}
+
+// width×height 캔버스에 draw(ctx)로 그린 뒤 JPEG Blob으로 변환
+// 반환: { blob, drawnAt(그린 시각), captureMs(그리기 시간), encodeMs(인코딩 시간), method }
+async function encodeJpeg(width, height, draw, quality) {
+  const mode = encoder.mode;
+  const t0 = performance.now();
+
+  if (mode === "worker" || mode === "offscreen") {
+    const c = encoder.offscreen;
+    if (c.width !== width || c.height !== height) { c.width = width; c.height = height; }
+    draw(encoder.offscreenCtx);
+    const drawnAt = performance.now();
+    try {
+      let blob;
+      if (mode === "worker") {
+        // 그린 결과를 ImageBitmap으로 떼어내 워커로 보냄 (메인 스레드는 바로 다음 일로)
+        blob = await encodeInWorker(c.transferToImageBitmap(), quality);
+      } else {
+        blob = await withTimeout(
+          c.convertToBlob({ type: "image/jpeg", quality }),
+          ENCODE_TIMEOUT_MS,
+          `OffscreenCanvas 인코딩 시간 초과 (${ENCODE_TIMEOUT_MS / 1000}초)`
+        );
+      }
+      return { blob, drawnAt, captureMs: drawnAt - t0, encodeMs: performance.now() - drawnAt, method: mode };
+    } catch (err) {
+      downgradeEncoder(mode, errorText(err));
+      return encodeJpeg(width, height, draw, quality); // 다음 방식으로 다시 그려서 인코딩
+    }
+  }
+
+  // dataurl: 동기 변환이라 미뤄지지 않음 (대신 변환하는 동안 메인 스레드를 잠깐 씀)
+  const c = encoder.canvas;
+  if (c.width !== width || c.height !== height) { c.width = width; c.height = height; }
+  draw(encoder.canvasCtx);
+  const drawnAt = performance.now();
+  const blob = dataUrlToBlob(c.toDataURL("image/jpeg", quality));
+  return { blob, drawnAt, captureMs: drawnAt - t0, encodeMs: performance.now() - drawnAt, method: "dataurl" };
+}
+
+// 현재 화면을 긴 변 longSide로 줄여 JPEG로 변환하고, 단계별 시간을 함께 돌려줌
+async function captureFrame(video, longSide) {
+  const vw = video.videoWidth;
+  const vh = video.videoHeight;
+  const scale = Math.min(1, longSide / Math.max(vw, vh)); // 확대는 하지 않음
+  const w = Math.round(vw * scale);
+  const h = Math.round(vh * scale);
+  const r = await encodeJpeg(w, h, (c) => c.drawImage(video, 0, 0, w, h), JPEG_QUALITY);
+  // capturedAt: 사진을 찍은 시각 (objectAgeMs 계산용)
+  return { blob: r.blob, capturedAt: r.drawnAt, captureMs: r.captureMs, encodeMs: r.encodeMs };
+}
+
+// multipart POST + 제한 시간. 응답 본문은 텍스트로 받고 JSON이면 파싱
+// 페이지를 열 때마다 새로 만드는 기기 ID (브라우저 저장소에는 저장하지 않음)
+const CLIENT_ID = (crypto.randomUUID ? crypto.randomUUID() : String(Math.random()).slice(2) + Date.now());
+
+async function postForm(url, formData, timeoutMs) {
+  const ac = new AbortController();
+  let timedOut = false;
+  const timer = setTimeout(() => { timedOut = true; ac.abort(); }, timeoutMs);
+  try {
+    // X-Client-Id: 같은 와이파이(같은 IP)의 관객들이 요청 제한을 나눠 쓰지 않도록 기기별 ID 전송
+    const headers = { "X-Client-Id": CLIENT_ID };
+    if (cfg.key) headers["X-API-Key"] = cfg.key;
+    const res = await fetch(url, { method: "POST", headers, body: formData, signal: ac.signal, cache: "no-store" });
+    const text = await res.text();
+    let body = null;
+    try { body = text ? JSON.parse(text) : null; } catch (_) { body = null; }
+    return { res, body, text };
+  } catch (err) {
+    if (timedOut) throw new Error(`시간 초과 (${timeoutMs / 1000}초)`);
+    throw new Error(`네트워크 오류: ${errorText(err)} (서버 주소, 서버 CORS 설정, 인터넷 연결 확인)`);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function requestDetect(video) {
+  const session = sessionId;
+  const version = cfgVersion;
+  const startedAt = performance.now();
+  srv.inFlight = true;
+  try {
+    const shot = await captureFrame(video, cfg.imgSize);
+    // 캡처·인코딩·전송 크기는 요청이 실패해도 매번 갱신
+    srv.lastCaptureMs = shot.captureMs;
+    srv.lastEncodeMs = shot.encodeMs;
+    srv.lastBytes = shot.blob.size;
+    const fd = new FormData();
+    fd.append("image", shot.blob, "frame.jpg");
+    fd.append("targets", cfg.targets.join(","));
+    fd.append("conf", String(SERVER_CONF));
+    fd.append("imgsz", String(cfg.imgSize));
+
+    const t0 = performance.now();
+    const { res, body, text } = await postForm(`${cfg.server}/detect`, fd, REQUEST_TIMEOUT_MS);
+    const rtt = performance.now() - t0;
+    if (session !== sessionId || version !== cfgVersion) return; // 이전 세션·설정의 응답은 버림
+
+    if (res.status === 429) {
+      // 요청 제한: 실패로 세지 않고 간격만 늘림
+      srv.rateLimited = true;
+      setStatus("서버 요청 제한(429): 2초 간격으로 늦춥니다", "warn", "server");
+      return;
+    }
+    if (res.status === 503) {
+      // 서버 과부하: 이번 주기는 로컬 인식 결과 사용 + 실패 1회
+      srv.localOnce = true;
+      registerFailure("서버 과부하(503), 이번에는 로컬 인식 사용");
+      return;
+    }
+    if (!res.ok) {
+      registerFailure(`HTTP ${res.status} ${text.slice(0, 200)}`);
+      return;
+    }
+    if (!body || !Array.isArray(body.detections)) {
+      registerFailure(`응답 형식 오류: ${text.slice(0, 200)}`);
+      return;
+    }
+    srv.lastTotalMs = shot.captureMs + shot.encodeMs + rtt;
+    handleDetectSuccess(body, rtt, shot.capturedAt);
+  } catch (err) {
+    if (session !== sessionId) return;
+    registerFailure(err.message || errorText(err));
+  } finally {
+    if (session === sessionId) {
+      srv.inFlight = false;
+      srv.lastStartedAt = startedAt; // 다음 요청은 이 시각 + 현재 간격 (매 프레임 계산)
+      renderStats();
+    }
+  }
+}
+
+function handleDetectSuccess(body, rtt, capturedAt) {
+  // 시간 기록
+  const total = Number(body.timing_ms && body.timing_ms.total);
+  srv.lastRtt = rtt;
+  srv.lastServerMs = Number.isFinite(total) ? total : null;
+  srv.lastNetMs = srv.lastServerMs !== null ? Math.max(0, rtt - srv.lastServerMs) : null;
+  srv.timingDetail = formatTiming(body.timing_ms);
+  if (body.device) srv.device = String(body.device);
+  if (body.model) srv.model = String(body.model);
+
+  // 왕복이 3번 연속 1초를 넘으면 이미지 크기를 한 단계 낮춤
+  if (rtt > SLOW_RTT_MS) {
+    srv.slowCount++;
+    if (srv.slowCount >= SLOW_RTT_STREAK) {
+      srv.slowCount = 0;
+      stepDownImageSize();
+    }
+  } else {
+    srv.slowCount = 0;
+  }
+
+  srv.failCount = 0;
+  srv.rateLimited = false;
+  if (srv.mode !== "server") {
+    srv.mode = "server";
+    setStatus("서버 연결 복구: 서버 인식으로 돌아왔습니다", "info", "server");
+  } else if (els.status.dataset.tag === "server") {
+    setStatus("인식 중");
+  }
+
+  // 결과 (서버는 찾는 물체만 보내줌)
+  const dets = body.detections.map(parseServerDetection).filter(Boolean);
+  const best = pickBest(dets);
+  // 높은 신뢰도로 연속 잡히면 간격을 늘리고, 놓치면 다시 짧게
+  if (best && best.score >= HIGH_CONF) srv.hitStreak++;
+  else srv.hitStreak = 0;
+
+  lastResult = { target: best ? toTarget(best) : null, best, detections: dets, others: [], capturedAt, source: "server" };
+  fps.object.count++;
+}
+
+function registerFailure(msg) {
+  srv.failCount++;
+  srv.hitStreak = 0;
+  if (srv.mode === "server" && srv.failCount >= FAIL_LIMIT) {
+    enterLocalMode(msg);
+    return;
+  }
+  if (srv.mode === "local") {
+    showLocalModeStatus(`서버 재연결 실패: ${msg}`);
+  } else {
+    setStatus(`서버 요청 실패 ${srv.failCount}/${FAIL_LIMIT}: ${msg}`, "warn", "server");
+  }
+}
+
+function enterLocalMode(msg) {
+  srv.mode = "local";
+  srv.rateLimited = false;
+  lastLocalRunAt = -Infinity;
+  // 로컬 모델이 찾을 수 없는 물체면 결과를 비움
+  if (localTargets().length === 0 || !models.object.task) {
+    lastResult = emptyResult("local");
+    lastResult.capturedAt = performance.now();
+  }
+  showLocalModeStatus(`서버 연결 끊김 (${FAIL_LIMIT}번 연속 실패): ${msg}`);
+}
+
+function showLocalModeStatus(reason) {
+  const lt = localTargets();
+  let what;
+  if (!models.object.task) what = `로컬 물체 인식 모델이 없어 찾을 수 없습니다${objectModelError ? ` (${objectModelError})` : ""}`;
+  else if (lt.length) what = `로컬 인식으로 찾는 중: ${lt.join(", ")}`;
+  else what = `"${cfg.targets.join(", ")}"은(는) 로컬 모델(기본 80종)에 없어 찾을 수 없습니다`;
+  const retry = cfg.server ? "\n5초마다 서버 재연결을 시도합니다" : "";
+  setStatus(`${reason}\n${what}${retry}`, "warn", "server");
+}
+
+function stepDownImageSize() {
+  const idx = IMAGE_SIZES.indexOf(cfg.imgSize);
+  if (idx <= 0) return;
+  cfg.imgSize = IMAGE_SIZES[idx - 1];
+  els.sizeSelect.value = String(cfg.imgSize);
+  setStatus(`응답이 느려 전송 이미지를 ${cfg.imgSize}px로 줄였습니다`, "warn", "server");
+}
+
+function formatTiming(t) {
+  if (!t || typeof t !== "object") return "";
+  return Object.entries(t)
+    .filter(([k]) => k !== "total")
+    .map(([k, v]) => `${k} ${typeof v === "number" ? Math.round(v * 10) / 10 : v}ms`)
+    .join(", ");
+}
+
+// =====================================================================
+// 로컬 물체 인식 (MediaPipe ObjectDetector, 대체용)
+// =====================================================================
+function localTargets() {
+  return cfg.targets.filter((t) => COCO_LABELS.has(t));
+}
+
+function runLocal(video, now, W, H) {
+  lastLocalRunAt = now;
+  const om = models.object;
+  if (!om.task || om.switching) return;
+  let res;
+  try {
+    res = om.task.detectForVideo(video, now);
+  } catch (err) {
+    handleRuntimeError("object", err);
+    return;
+  }
+  const all = parseLocalObjects(res, W, H);
+  const lt = localTargets();
+  const dets = all.filter((o) => lt.includes(o.label));
+  const others = all.filter((o) => !lt.includes(o.label));
+  const best = pickBest(dets);
+  lastResult = { target: best ? toTarget(best) : null, best, detections: dets, others, capturedAt: now, source: "local" };
+  fps.object.count++;
+}
+
+// =====================================================================
+// 결과 변환
+// =====================================================================
+const clamp01 = (v) => Math.min(1, Math.max(0, v));
+
+function buildHand(lm) {
+  const tip = lm[8];
+  const wrist = lm[0];
+  const mcp = lm[9];
+  return {
+    indexTip: { x: clamp01(tip.x), y: clamp01(tip.y) },
+    palmCenter: { x: clamp01((wrist.x + mcp.x) / 2), y: clamp01((wrist.y + mcp.y) / 2) },
+  };
+}
+
+function normBox(x, y, w, h) {
+  const x1 = clamp01(x);
+  const y1 = clamp01(y);
+  const x2 = clamp01(x + w);
+  const y2 = clamp01(y + h);
+  return { x: x1, y: y1, w: x2 - x1, h: y2 - y1 };
+}
+
+// 서버 박스는 이미 0~1 정규화, x·y는 왼쪽 위 꼭짓점
+function parseServerDetection(d) {
+  if (!d || !d.box) return null;
+  const score = Number(d.score);
+  const b = d.box;
+  if (![b.x, b.y, b.w, b.h].every((v) => Number.isFinite(Number(v)))) return null;
+  return {
+    label: String(d.label ?? ""),
+    score: Number.isFinite(score) ? score : 0,
+    box: normBox(Number(b.x), Number(b.y), Number(b.w), Number(b.h)),
+  };
+}
+
+// MediaPipe 박스는 픽셀 단위라 영상 크기로 나눔
+function parseLocalObjects(res, W, H) {
+  const list = [];
+  for (const d of res.detections || []) {
+    const c = d.categories && d.categories[0];
+    const b = d.boundingBox;
+    if (!c || !b) continue;
+    list.push({
+      label: (c.categoryName || c.displayName || "").toLowerCase(),
+      score: c.score,
+      box: normBox(b.originX / W, b.originY / H, b.width / W, b.height / H),
+    });
+  }
+  return list;
+}
+
+function pickBest(list) {
+  let best = null;
+  for (const o of list) if (!best || o.score > best.score) best = o;
+  return best;
+}
+
+function toTarget(d) {
+  const { x, y, w, h } = d.box;
+  return { label: d.label, score: d.score, box: { x, y, w, h }, center: { x: x + w / 2, y: y + h / 2 } };
+}
+
+// =====================================================================
+// FPS·상태 표시
+// =====================================================================
+function updateFps(now) {
+  const dt = now - fps.windowStart;
+  if (dt < 1000) return;
+  fps.hand.value = Math.round((fps.hand.count * 1000) / dt * 10) / 10;
+  fps.object.value = Math.round((fps.object.count * 1000) / dt * 10) / 10;
+  fps.hand.count = 0;
+  fps.object.count = 0;
+  fps.windowStart = now;
+  renderStats();
+}
+
+function renderStats() {
+  const ms = (v) => (v === null || v === undefined ? "–" : `${Math.round(v)}ms`);
+  if (!cfg.server) els.modeVal.textContent = "로컬";
+  else els.modeVal.textContent = srv.mode === "server" ? "서버" : "로컬(끊김)";
+  els.handFpsVal.textContent = running ? fps.hand.value.toFixed(1) : "–";
+  els.objFpsVal.textContent = running ? fps.object.value.toFixed(1) : "–";
+  // 10ms 미만은 소수 한 자리까지 (캡처·인코딩은 보통 몇 ms라서)
+  const fine = (v) => (v === null || v === undefined ? "–" : v < 10 ? `${v.toFixed(1)}ms` : `${Math.round(v)}ms`);
+  els.captureVal.textContent = fine(srv.lastCaptureMs);
+  els.encodeVal.textContent = fine(srv.lastEncodeMs);
+  els.encodeLabel.textContent = `인코딩 (${ENCODER_LABELS[encoder.mode]})`;
+  els.bytesVal.textContent = srv.lastBytes === null ? "–" : `${(srv.lastBytes / 1024).toFixed(1)}KB`;
+  els.sizeLabel.textContent = `전송 크기 (${cfg.imgSize}px)`;
+  els.rttVal.textContent = ms(srv.lastRtt);
+  els.totalVal.textContent = ms(srv.lastTotalMs);
+  els.serverMsVal.textContent = ms(srv.lastServerMs);
+  els.netVal.textContent = ms(srv.lastNetMs);
+  if (!cfg.server) els.intervalVal.textContent = `${LOCAL_INTERVAL_MS}ms`;
+  else if (srv.mode === "local") els.intervalVal.textContent = "재연결 5초";
+  else {
+    // 물체는 안정적인데 손 때문에 0.3초를 유지하는 중이면 표시
+    const handHold = srv.hitStreak >= HIGH_CONF_STREAK && !srv.rateLimited && isHandVisible();
+    els.intervalVal.textContent = `${currentInterval()}ms${handHold ? " (손)" : ""}`;
+  }
+  els.deviceVal.textContent = srv.device || "–";
+
+  const parts = [];
+  if (srv.timingDetail) parts.push(`서버 세부: ${srv.timingDetail}`);
+  if (srv.model) parts.push(`모델: ${srv.model}`);
+  const d = (m) => (m.task ? m.delegate : m.switching ? "전환 중" : "없음");
+  parts.push(`손 ${d(models.hand)} / 로컬 물체 ${d(models.object)}`);
+  els.timingDetail.textContent = parts.join(" | ");
+}
+
+// =====================================================================
+// 그리기
+// =====================================================================
+function draw(handLandmarks, now) {
+  const W = els.canvas.width;
+  const H = els.canvas.height;
+  ctx.clearRect(0, 0, W, H);
+  const s = W / Math.max(1, els.canvas.clientWidth); // 화면에서 선 두께를 일정하게
+
+  const r = lastResult;
+
+  // 찾는 물체가 아닌 것 (로컬 모드, "다른 물체 보기"일 때만 흐리게)
+  if (showOthers) {
+    for (const o of r.others) {
+      drawBox(o, W, H, s, { color: COLOR_OTHER, alpha: 0.35, width: 1.5, text: `${o.label} ${pct(o.score)}`, weight: 500 });
+    }
+  }
+
+  // 찾는 물체: 진하게. 신뢰도가 가장 높은 것은 더 두껍게
+  const suffix = r.source === "local" ? " (로컬)" : "";
+  for (const d of r.detections) {
+    const isBest = d === r.best;
+    drawBox(d, W, H, s, { color: COLOR_TARGET, alpha: isBest ? 1 : 0.8, width: isBest ? 4 : 2.5, text: `${d.label} ${pct(d.score)}${suffix}`, weight: 800 });
+  }
+  if (r.target) {
+    const cx = r.target.center.x * W;
+    const cy = r.target.center.y * H;
+    ctx.save();
+    ctx.strokeStyle = COLOR_TARGET;
+    ctx.lineWidth = 3 * s;
+    ctx.beginPath();
+    ctx.moveTo(cx - 12 * s, cy); ctx.lineTo(cx + 12 * s, cy);
+    ctx.moveTo(cx, cy - 12 * s); ctx.lineTo(cx, cy + 12 * s);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  // 서버 연결 끊김 표시
+  if (cfg.server && srv.mode === "local") drawTag("서버 연결 끊김", COLOR_DISCONNECT, W, s);
+
+  // 잡을 위치 (설명 요청 응답의 grasp_point)
+  if (graspMark && now < graspMark.until) drawGrasp(graspMark.x * W, graspMark.y * H, s);
+
+  if (handLandmarks) drawHand(handLandmarks, W, H, s);
+}
+
+const pct = (v) => `${Math.round(v * 100)}%`;
+
+function drawBox(o, W, H, s, style) {
+  const x = o.box.x * W;
+  const y = o.box.y * H;
+  const w = o.box.w * W;
+  const h = o.box.h * H;
+  ctx.save();
+  ctx.globalAlpha = style.alpha;
+  ctx.strokeStyle = style.color;
+  ctx.lineWidth = style.width * s;
+  ctx.strokeRect(x, y, w, h);
+
+  const fontPx = 16 * s;
+  ctx.font = `${style.weight} ${fontPx}px system-ui, sans-serif`;
+  const pad = 4 * s;
+  const tw = ctx.measureText(style.text).width;
+  const th = fontPx + pad * 2;
+  const ty = y - th >= 0 ? y - th : y;
+  ctx.fillStyle = style.color;
+  ctx.fillRect(x, ty, tw + pad * 2, th);
+  ctx.fillStyle = "#000000";
+  ctx.textBaseline = "top";
+  ctx.fillText(style.text, x + pad, ty + pad);
+  ctx.restore();
+}
+
+function drawTag(text, color, W, s) {
+  ctx.save();
+  const fontPx = 18 * s;
+  ctx.font = `800 ${fontPx}px system-ui, sans-serif`;
+  const pad = 8 * s;
+  const tw = ctx.measureText(text).width;
+  ctx.fillStyle = color;
+  ctx.fillRect(10 * s, 10 * s, tw + pad * 2, fontPx + pad * 2);
+  ctx.fillStyle = "#ffffff";
+  ctx.textBaseline = "top";
+  ctx.fillText(text, 10 * s + pad, 10 * s + pad);
+  ctx.restore();
+}
+
+function drawGrasp(x, y, s) {
+  ctx.save();
+  ctx.fillStyle = COLOR_GRASP;
+  ctx.beginPath();
+  ctx.arc(x, y, 10 * s, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.strokeStyle = "#ffffff";
+  ctx.lineWidth = 3 * s;
+  ctx.beginPath();
+  ctx.arc(x, y, 16 * s, 0, Math.PI * 2);
+  ctx.stroke();
+  ctx.font = `800 ${15 * s}px system-ui, sans-serif`;
+  ctx.fillStyle = COLOR_GRASP;
+  ctx.textBaseline = "middle";
+  ctx.fillText("잡을 곳", x + 22 * s, y);
+  ctx.restore();
+}
+
+function drawHand(lm, W, H, s) {
+  ctx.save();
+  ctx.strokeStyle = COLOR_HAND_LINE;
+  ctx.lineWidth = 3 * s;
+  ctx.lineCap = "round";
+  ctx.beginPath();
+  for (const [a, b] of HAND_CONNECTIONS) {
+    ctx.moveTo(lm[a].x * W, lm[a].y * H);
+    ctx.lineTo(lm[b].x * W, lm[b].y * H);
+  }
+  ctx.stroke();
+
+  ctx.fillStyle = COLOR_HAND_POINT;
+  ctx.lineWidth = 1.5 * s;
+  for (let i = 0; i < lm.length; i++) {
+    if (i === 8) continue;
+    ctx.beginPath();
+    ctx.arc(lm[i].x * W, lm[i].y * H, 4 * s, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+  }
+
+  // 손바닥 중심 (손목과 중지 뿌리의 중간)
+  const px = ((lm[0].x + lm[9].x) / 2) * W;
+  const py = ((lm[0].y + lm[9].y) / 2) * H;
+  ctx.lineWidth = 2.5 * s;
+  ctx.beginPath();
+  ctx.arc(px, py, 8 * s, 0, Math.PI * 2);
+  ctx.stroke();
+
+  // 검지 끝 강조
+  const ix = lm[8].x * W;
+  const iy = lm[8].y * H;
+  ctx.fillStyle = COLOR_INDEX_TIP;
+  ctx.beginPath();
+  ctx.arc(ix, iy, 11 * s, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.strokeStyle = "#ffffff";
+  ctx.lineWidth = 3 * s;
+  ctx.beginPath();
+  ctx.arc(ix, iy, 17 * s, 0, Math.PI * 2);
+  ctx.stroke();
+  ctx.restore();
+}
+
+function updateDebug(detection, now) {
+  if (now - lastDebugUpdate < 200) return;
+  lastDebugUpdate = now;
+  els.output.textContent = JSON.stringify(
+    detection,
+    (k, v) => (typeof v === "number" ? Math.round(v * 1000) / 1000 : v),
+    2
+  );
+}
+
+// =====================================================================
+// VLM 설명 요청 (POST /describe)
+// =====================================================================
+async function requestDescribe() {
+  if (describeInFlight) return;
+  unlockSpeech(); // 버튼을 누른 순간에 음성 재생 권한 확보 (아이폰 대비)
+  if (!running) { setStatus("먼저 시작 버튼을 눌러 카메라를 켜세요", "warn"); return; }
+  if (!cfg.server) { setStatus("서버 주소를 입력해야 설명을 요청할 수 있습니다", "warn"); return; }
+  const t = lastResult.target;
+  if (!t) { setStatus("찾는 물체가 화면에 없어 설명을 요청할 수 없습니다", "warn"); return; }
+
+  // 박스를 사방 20% 넓혀서 자르기
+  const video = els.video;
+  const vw = video.videoWidth;
+  const vh = video.videoHeight;
+  const b = t.box;
+  const x0 = clamp01(b.x - b.w * DESCRIBE_PAD);
+  const y0 = clamp01(b.y - b.h * DESCRIBE_PAD);
+  const x1 = clamp01(b.x + b.w * (1 + DESCRIBE_PAD));
+  const y1 = clamp01(b.y + b.h * (1 + DESCRIBE_PAD));
+  const sw = (x1 - x0) * vw;
+  const sh = (y1 - y0) * vh;
+  if (sw < 4 || sh < 4) { setStatus("물체 박스가 너무 작아 자를 수 없습니다", "warn"); return; }
+  const scale = Math.min(1, DESCRIBE_MAX_SIDE / Math.max(sw, sh));
+  const cw = Math.max(1, Math.round(sw * scale));
+  const ch = Math.max(1, Math.round(sh * scale));
+  const crop = { x0, y0, x1, y1, w: cw, h: ch };
+
+  describeInFlight = true;
+  els.describeBtn.disabled = true;
+  els.describeBtn.textContent = "설명 요청 중…";
+  const t0 = performance.now();
+  try {
+    const { blob } = await encodeJpeg(
+      cw, ch,
+      (c) => c.drawImage(video, x0 * vw, y0 * vh, sw, sh, 0, 0, cw, ch),
+      DESCRIBE_JPEG_QUALITY
+    );
+    const fd = new FormData();
+    fd.append("image", blob, "crop.jpg");
+    const { res, body, text } = await postForm(`${cfg.server}/describe`, fd, DESCRIBE_TIMEOUT_MS);
+    const elapsed = Math.round(performance.now() - t0);
+    if (!res.ok) throw new Error(`HTTP ${res.status} (${elapsed}ms) ${text.slice(0, 300)}`);
+    if (!body) throw new Error(`응답이 JSON이 아닙니다 (${elapsed}ms): ${text.slice(0, 300)}`);
+
+    els.describeOut.textContent = `응답 시간: ${elapsed}ms\n대상: ${t.label} ${pct(t.score)}\n\n${JSON.stringify(body, null, 2)}`;
+    els.describePanel.open = true;
+
+    // 잡을 위치 표시
+    const gp = parseGraspPoint(body.grasp_point ?? (body.grasp && body.grasp.grasp_point), crop);
+    graspMark = gp ? { x: gp.x, y: gp.y, until: performance.now() + GRASP_SHOW_MS } : null;
+
+    speakDescription(body);
+    setStatus(`설명 응답 받음 (${elapsed}ms)`);
+  } catch (err) {
+    els.describeOut.textContent = `실패: ${errorText(err)}`;
+    els.describePanel.open = true;
+    showError(err, "설명 요청 - ");
+  } finally {
+    describeInFlight = false;
+    els.describeBtn.disabled = false;
+    els.describeBtn.textContent = "설명 요청";
+  }
+}
+
+// grasp_point: {x,y} 또는 [x,y]. 0~1이면 잘라낸 이미지 기준 정규화 좌표,
+// 1보다 크면 잘라낸 이미지의 픽셀 좌표로 보고 전체 화면 좌표로 바꿈
+function parseGraspPoint(gp, crop) {
+  if (!gp) return null;
+  let x, y;
+  if (Array.isArray(gp)) [x, y] = gp;
+  else if (typeof gp === "object") ({ x, y } = gp);
+  x = Number(x);
+  y = Number(y);
+  if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+  if (x > 1 || y > 1) { x /= crop.w; y /= crop.h; }
+  return {
+    x: clamp01(crop.x0 + clamp01(x) * (crop.x1 - crop.x0)),
+    y: clamp01(crop.y0 + clamp01(y) * (crop.y1 - crop.y0)),
+  };
+}
+
+// =====================================================================
+// 브라우저 음성 (한국어): safety → grasp → comment 순서
+// =====================================================================
+function pickKoreanVoice() {
+  if (!("speechSynthesis" in window)) return;
+  const voices = speechSynthesis.getVoices();
+  koVoice = voices.find((v) => v.lang && v.lang.toLowerCase().startsWith("ko")) || null;
+}
+if ("speechSynthesis" in window) {
+  pickKoreanVoice();
+  speechSynthesis.onvoiceschanged = pickKoreanVoice;
+}
+
+// 아이폰 등은 사용자 동작 안에서 한 번 재생해야 이후 음성이 나옴
+function unlockSpeech() {
+  if (speechUnlocked || !("speechSynthesis" in window)) return;
+  const u = new SpeechSynthesisUtterance(" ");
+  u.volume = 0;
+  speechSynthesis.speak(u);
+  speechUnlocked = true;
+}
+
+function toSpeech(v) {
+  if (v === null || v === undefined) return "";
+  if (typeof v === "string") return v.trim();
+  if (typeof v === "number" || typeof v === "boolean") return String(v);
+  if (Array.isArray(v)) return v.map(toSpeech).filter(Boolean).join(". ");
+  if (typeof v === "object") return Object.values(v).filter((x) => typeof x === "string").join(". ");
+  return "";
+}
+
+function speakDescription(body) {
+  if (!("speechSynthesis" in window)) {
+    setStatus("이 브라우저는 음성 읽기를 지원하지 않습니다", "warn");
+    return;
+  }
+  const grasp = body.grasp && typeof body.grasp === "object" && !Array.isArray(body.grasp)
+    ? (body.grasp.text ?? body.grasp.description ?? body.grasp)
+    : body.grasp;
+  const parts = [toSpeech(body.safety), toSpeech(grasp), toSpeech(body.comment)].filter(Boolean);
+  speechSynthesis.cancel();
+  for (const text of parts) {
+    const u = new SpeechSynthesisUtterance(text);
+    u.lang = "ko-KR";
+    if (koVoice) u.voice = koVoice;
+    speechSynthesis.speak(u);
+  }
+}
+
+// =====================================================================
+// QR 코드
+// =====================================================================
+// QR 주소에는 key와 target만 넣음 (server·dev는 넣지 않음)
+// mask=true 이면 화면 표시용으로 키를 가림
+function buildShareUrl(mask = false) {
+  const base = location.href.split("#")[0];
+  const p = new URLSearchParams();
+  if (cfg.key) p.set("key", mask ? "KEY" : cfg.key);
+  p.set("target", cfg.targets.join(","));
+  const url = `${base}#${p.toString()}`;
+  return mask ? url.replace("key=KEY", "key=••••") : url;
+}
+
+function showQr() {
+  readConfig();
+  if (typeof window.QRious !== "function") {
+    showError("QR 라이브러리를 불러오지 못했습니다. 인터넷 연결을 확인하고 새로고침하세요.");
+    return;
+  }
+  const url = buildShareUrl();
+
+  // 관객 폰에서 열 수 없는 주소면 경고
+  const warns = [];
+  if (location.protocol !== "https:" || /^(localhost|127\.0\.0\.1)$/.test(location.hostname)) {
+    warns.push("지금 페이지 주소는 관객 폰에서 열 수 없습니다. HTTPS로 배포한 주소에서 QR을 띄워 주세요.");
+  }
+  if (!cfg.key) warns.push("API 키가 비어 있습니다. 주소 # 뒤에 key 값을 넣어 주세요.");
+  // QR에는 서버 주소가 들어가지 않으므로, 관객은 이 페이지와 같은 주소의 서버를 씀
+  if (cfg.server && cfg.server !== location.origin) {
+    warns.push(`QR로 접속한 관객은 ${location.origin} 서버를 사용합니다. 지금 입력한 서버 주소(${cfg.server})와 다릅니다.`);
+  }
+  els.qrWarn.textContent = warns.join(" ");
+  els.qrWarn.hidden = warns.length === 0;
+
+  els.qrModal.hidden = false;
+  const cssSize = Math.floor(Math.min(window.innerWidth, window.innerHeight) * 0.75);
+  const dpr = Math.min(3, window.devicePixelRatio || 1);
+  new window.QRious({
+    element: els.qrCanvas,
+    value: url,
+    size: Math.round(cssSize * dpr),
+    level: "M",
+    background: "#ffffff",
+    foreground: "#000000",
+  });
+  els.qrCanvas.style.width = `${cssSize}px`;
+  els.qrCanvas.style.height = `${cssSize}px`;
+  // 화면에는 키를 가려서 표시
+  els.qrUrl.textContent = buildShareUrl(true);
+  els.qrCloseBtn.focus();
+}
+
+function hideQr() {
+  els.qrModal.hidden = true;
+  els.qrBtn.focus();
+}
+
+// =====================================================================
+// 버튼·입력 이벤트
+// =====================================================================
+els.startBtn.addEventListener("click", () => {
+  if (starting) return;
+  if (running) { stop(); setStatus("정지됨"); renderStats(); }
+  else start();
+});
+els.describeBtn.addEventListener("click", requestDescribe);
+els.settingsBtn.addEventListener("click", () => setSettingsOpen(els.settings.hidden));
+els.qrBtn.addEventListener("click", showQr);
+els.qrCloseBtn.addEventListener("click", hideQr);
+document.addEventListener("keydown", (e) => { if (e.key === "Escape" && !els.qrModal.hidden) hideQr(); });
+els.othersBtn.addEventListener("click", () => {
+  showOthers = !showOthers;
+  els.othersBtn.setAttribute("aria-pressed", String(showOthers));
+  els.othersBtn.textContent = showOthers ? "찾는 물체만" : "다른 물체 보기";
+});
+for (const input of [els.serverInput, els.keyInput, els.targetInput]) {
+  input.addEventListener("change", readConfig);
+}
+els.sizeSelect.addEventListener("change", () => {
+  srv.slowCount = 0; // 직접 고르면 느림 횟수 초기화
+  readConfig();
+});
+window.addEventListener("hashchange", applyHash);
+
+// =====================================================================
+// 초기화: 설정 읽기 → 브라우저 확인 → 모델 미리 불러오기
+// =====================================================================
+initEncoder();
+applyHash();
+checkBrowser();
+renderStats();
+ensureModels()
+  .then(() => {
+    if (running || starting) return;
+    if (missingKeyNotice()) setStatus(missingKeyNotice(), "warn");
+    else if (objectModelError) setStatus(`모델 준비 완료. 단, 로컬 대체 모델을 불러오지 못했습니다: ${objectModelError}`, "warn");
+    else setStatus("모델 준비 완료. 시작 버튼을 누르세요");
+  })
+  .catch((err) => showError(err, "모델 불러오기 실패 - "));
+</script>
+</body>
+</html>

@@ -1,0 +1,12 @@
+# torch / torchvision 은 넣지 않음: Deep Learning VM에 이미 설치된 PyTorch 2.9를 그대로 사용
+# 설치: python3 -m pip install -r requirements.txt -c constraints.txt  (constraints.txt 만드는 법은 README 참고)
+ultralytics>=8.4.0
+# YOLOE-26 텍스트 인코더(MobileCLIP2)의 토크나이저. 미리 설치해 실행 중 자동 설치를 피함 (git 필요)
+clip @ git+https://github.com/ultralytics/CLIP.git
+fastapi>=0.110
+uvicorn>=0.29
+python-multipart>=0.0.9
+httpx>=0.27
+numpy
+# test_detect.py 용
+requests

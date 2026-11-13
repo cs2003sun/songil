@@ -1,0 +1,3524 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<!-- 화면 확대 막기 (두 번 탭 확대·핀치 확대) -->
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#000000">
+<title>물건 찾기 도우미</title>
+<!-- QR 코드 라이브러리 (cdnjs, 버전 고정) - #dev 화면의 QR 보기에서만 사용 -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrious/4.0.2/qrious.min.js"></script>
+<style>
+  /* ===== 색상: 저시력 사용자를 위한 고대비 고정 (테마와 무관) ===== */
+  :root {
+    color-scheme: dark;
+    --bg: #000000;
+    --fg: #ffffff;
+    --fg-dim: #d6d6d6;
+    --signal: #ffd400;       /* 말하기·시작 버튼 (검정 글자와 대비 15:1) */
+    --signal-ink: #000000;
+    --warn: #ffd400;
+    --error: #ff8f85;
+    --dev-surface: #1a1a1a;
+    --dev-line: #3a3a3a;
+    --dev-muted: #a9a9a9;
+  }
+
+  * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
+
+  /* 스크롤·당겨서 새로고침·확대 막기 */
+  html, body {
+    margin: 0;
+    height: 100%;
+    overflow: hidden;
+    overscroll-behavior: none;
+    background: var(--bg);
+    color: var(--fg);
+  }
+  body {
+    font-family: system-ui, -apple-system, "Noto Sans KR", "Apple SD Gothic Neo", "Malgun Gothic", sans-serif;
+    touch-action: none;
+    -webkit-user-select: none;
+    user-select: none;
+    -webkit-touch-callout: none;
+    -webkit-tap-highlight-color: transparent;
+    -webkit-text-size-adjust: 100%;
+  }
+  button { font: inherit; touch-action: none; cursor: pointer; }
+
+  /* ===== 시작 화면: 화면 전체가 하나의 버튼 ===== */
+  .start {
+    position: fixed;
+    inset: 0;
+    z-index: 30;
+    width: 100%;
+    height: 100%;
+    margin: 0;
+    border: 0;
+    background: var(--signal);
+    color: var(--signal-ink);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 20px;
+    padding: calc(24px + env(safe-area-inset-top, 0px)) 24px calc(24px + env(safe-area-inset-bottom, 0px));
+  }
+  .start-word {
+    font-size: clamp(96px, 32vw, 220px);
+    font-weight: 900;
+    line-height: 1;
+    letter-spacing: -0.03em;
+  }
+  .start-note {
+    font-size: clamp(19px, 5.2vw, 28px);
+    font-weight: 700;
+    line-height: 1.4;
+    max-width: 20em;
+    text-align: center;
+  }
+  .start-warn {
+    font-size: clamp(16px, 4.2vw, 22px);
+    font-weight: 700;
+    line-height: 1.4;
+    max-width: 22em;
+    text-align: center;
+    padding: 10px 14px;
+    border: 3px solid var(--signal-ink);
+    border-radius: 12px;
+  }
+  .start:focus-visible { outline: 6px solid var(--signal-ink); outline-offset: -14px; }
+
+  /* ===== 앱 화면 ===== */
+  .app {
+    position: fixed;
+    inset: 0;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: auto minmax(0, 1fr) auto;
+    padding: env(safe-area-inset-top, 0px) env(safe-area-inset-right, 0px)
+             env(safe-area-inset-bottom, 0px) env(safe-area-inset-left, 0px);
+  }
+
+  /* 상단: 현재 상태 한 줄 + 방금 말한 문장 */
+  .readout { padding: 12px 18px 10px; }
+  .state-line {
+    font-size: clamp(28px, 8.4vw, 50px);
+    font-weight: 800;
+    line-height: 1.15;
+    letter-spacing: -0.01em;
+    overflow-wrap: anywhere;
+  }
+  .caption {
+    margin-top: 6px;
+    min-height: 1.4em;
+    font-size: clamp(18px, 5vw, 27px);
+    font-weight: 600;
+    line-height: 1.4;
+    color: var(--fg-dim);
+    overflow-wrap: anywhere;
+  }
+  .subline {
+    margin-top: 6px;
+    font-size: 15px;
+    line-height: 1.4;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    color: var(--fg-dim);
+  }
+  .subline:empty { display: none; }
+  .subline[data-kind="warn"] { color: var(--warn); }
+  .subline[data-kind="error"] { color: var(--error); font-weight: 700; }
+  /* 관객 화면에서는 일반 정보 메시지는 숨기고 경고·오류만 표시 */
+  body:not(.dev) .subline[data-kind="info"] { display: none; }
+
+  /* 가운데: 카메라 영상 위에 큰 말하기 버튼을 겹침 */
+  .main { position: relative; min-height: 0; overflow: hidden; }
+  .stage {
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    width: 0;
+    height: 0;
+    transform: translate(-50%, -50%);
+    pointer-events: none;
+    background: #000;
+  }
+  .stage video, .stage canvas {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    display: block;
+  }
+  .stage video { object-fit: fill; }
+
+  .talk {
+    position: absolute;
+    inset: 8px 10px 10px;
+    margin: 0;
+    border: 0;
+    border-radius: 28px;
+    background: transparent;
+    color: var(--signal-ink);
+    box-shadow: inset 0 0 0 6px var(--signal);
+    display: flex;
+    align-items: flex-end;
+    justify-content: center;
+    padding: 0 12px 26px;
+  }
+  .talk-pill {
+    background: var(--signal);
+    color: var(--signal-ink);
+    font-size: clamp(42px, 13.5vw, 80px);
+    font-weight: 900;
+    line-height: 1.15;
+    padding: 0.1em 0.62em 0.14em;
+    border-radius: 999px;
+    box-shadow: 0 0 0 4px #000;
+    white-space: nowrap;
+  }
+  .talk:active .talk-pill { transform: scale(0.97); }
+  .talk:focus-visible { outline: 4px solid var(--fg); outline-offset: -2px; }
+  /* 듣는 중: 테두리를 두껍게 */
+  body[data-listen="waiting"] .talk,
+  body[data-listen="starting"] .talk { box-shadow: inset 0 0 0 10px var(--signal); }
+  body[data-listen="on"] .talk {
+    box-shadow: inset 0 0 0 16px var(--signal);
+    background: rgba(255, 212, 0, 0.14);
+    animation: listen-pulse 1.1s ease-in-out infinite;
+  }
+  @keyframes listen-pulse { 50% { box-shadow: inset 0 0 0 26px var(--signal); } }
+  @media (prefers-reduced-motion: reduce) {
+    body[data-listen="on"] .talk { animation: none; }
+  }
+
+  /* 아래: 그만 버튼 */
+  .stop {
+    height: clamp(84px, 15dvh, 140px);
+    margin: 0 10px 10px;
+    border: 0;
+    border-radius: 22px;
+    background: var(--fg);
+    color: #000;
+    font-size: clamp(34px, 10.5vw, 58px);
+    font-weight: 900;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.35em;
+  }
+  .stop::before {
+    content: "";
+    width: 0.6em;
+    height: 0.6em;
+    border-radius: 0.08em;
+    background: #000;
+  }
+  .stop:active { transform: scale(0.99); }
+  .stop:focus-visible { outline: 4px solid var(--signal); outline-offset: 3px; }
+
+  /* ===== #dev 화면 ===== */
+  body.dev .app { grid-template-rows: auto minmax(0, 1fr) auto minmax(0, 42dvh); }
+  @media (min-width: 900px) {
+    body.dev .app { grid-template-columns: minmax(0, 1fr) 420px; grid-template-rows: auto minmax(0, 1fr) auto; }
+    body.dev .app > * { grid-column: 1; }
+    body.dev .app > .dev-panel { grid-column: 2; grid-row: 1 / -1; border-top: 0; border-left: 2px solid var(--dev-line); }
+  }
+  .dev-panel {
+    overflow-y: auto;
+    touch-action: pan-y;
+    overscroll-behavior: contain;
+    -webkit-user-select: text;
+    user-select: text;
+    background: var(--dev-surface);
+    border-top: 2px solid var(--dev-line);
+    padding: 8px 8px 16px;
+    font-size: 14px;
+  }
+  .dev-panel h2 { margin: 0 0 6px; font-size: 14px; color: var(--dev-muted); font-weight: 600; }
+  .dev-panel button, .dev-panel input, .dev-panel select { touch-action: manipulation; }
+  .stats { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; }
+  .stat { background: #000; border: 1px solid var(--dev-line); border-radius: 8px; padding: 4px 8px; min-width: 0; }
+  .stat-label { font-size: 11px; color: var(--dev-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .stat-value { font-size: 16px; font-weight: 700; font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .timing { margin: 6px 2px 0; font-size: 12px; color: var(--dev-muted); overflow-wrap: anywhere; }
+  .dev-box { margin-top: 8px; background: #000; border: 1px solid var(--dev-line); border-radius: 8px; padding: 8px 10px; }
+  .dev-box summary { cursor: pointer; color: var(--dev-muted); }
+  .dev-box pre {
+    margin: 6px 0 0;
+    max-height: 30vh;
+    overflow: auto;
+    font-size: 12px;
+    line-height: 1.45;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+  #guideInfo { font-size: 14px; max-height: none; }
+  .settings { display: grid; gap: 8px; }
+  .settings label { display: grid; gap: 4px; font-size: 13px; color: var(--dev-muted); min-width: 0; }
+  .settings input, .settings select {
+    font: inherit;
+    font-size: 16px; /* 아이폰 확대 방지 */
+    padding: 8px 10px;
+    border: 1px solid var(--dev-line);
+    border-radius: 8px;
+    background: var(--dev-surface);
+    color: var(--fg);
+    width: 100%;
+  }
+  .settings .row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; align-items: end; }
+  .settings .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .settings button {
+    min-height: 42px;
+    padding: 0 14px;
+    font-size: 15px;
+    font-weight: 700;
+    border-radius: 8px;
+    border: 1px solid var(--dev-line);
+    background: var(--dev-surface);
+    color: var(--fg);
+  }
+  .settings button:focus-visible, .settings input:focus-visible, .settings select:focus-visible { outline: 3px solid var(--signal); outline-offset: 1px; }
+  ol.log { margin: 6px 0 0; padding: 0 0 0 4px; list-style: none; max-height: 26vh; overflow: auto; font-size: 12px; line-height: 1.5; }
+  ol.log li { border-bottom: 1px solid #262626; padding: 2px 0; overflow-wrap: anywhere; white-space: pre-wrap; }
+
+  /* ===== QR 화면 (#dev) ===== */
+  .modal {
+    position: fixed;
+    inset: 0;
+    z-index: 40;
+    background: #000;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 12px;
+    padding: calc(16px + env(safe-area-inset-top, 0px)) 16px calc(16px + env(safe-area-inset-bottom, 0px));
+    overflow: auto;
+  }
+  #qrCanvas { background: #fff; padding: 12px; border-radius: 12px; max-width: 100%; height: auto; }
+  #qrUrl { font-size: 13px; color: var(--dev-muted); max-width: 640px; text-align: center; word-break: break-all; }
+  #qrWarn { max-width: 640px; color: var(--warn); font-weight: 700; text-align: center; }
+  #qrCloseBtn {
+    min-width: 200px;
+    min-height: 52px;
+    font-size: 18px;
+    font-weight: 800;
+    border: 0;
+    border-radius: 12px;
+    background: var(--signal);
+    color: var(--signal-ink);
+    touch-action: manipulation;
+  }
+</style>
+</head>
+<body data-state="boot" data-listen="off">
+
+  <!-- 시작 화면 (첫 터치로 카메라·마이크·소리 활성화) -->
+  <button id="startBtn" class="start" type="button" aria-label="시작. 카메라와 음성 안내를 켭니다">
+    <span class="start-word" id="startWord" aria-hidden="true">시작</span>
+    <span class="start-note" id="startNote" aria-hidden="true">누르면 카메라와 음성 안내가 켜져요</span>
+    <span class="start-warn" id="startWarn" aria-hidden="true" hidden></span>
+  </button>
+
+  <div class="app" id="app" inert>
+    <!-- 상태 표시: 안내는 앱 음성으로만 하므로 화면 낭독에서 제외 -->
+    <div class="readout" aria-hidden="true">
+      <div class="state-line" id="stateLine">준비 중</div>
+      <div class="caption" id="caption"></div>
+      <div class="subline" id="status" data-kind="info"></div>
+    </div>
+
+    <div class="main" id="main">
+      <!-- 카메라 영상과 박스·손 표시 (장식 요소) -->
+      <div class="stage" id="stage" aria-hidden="true">
+        <video id="video" playsinline muted autoplay aria-hidden="true"></video>
+        <canvas id="overlay" aria-hidden="true"></canvas>
+      </div>
+      <!-- 화면 대부분을 차지하는 말하기 버튼 (TalkBack: 두 번 탭, 일반: 한 번 탭 → 같은 click) -->
+      <button id="talkBtn" class="talk" type="button" aria-label="말하기. 찾을 물건을 말씀하세요">
+        <span class="talk-pill" id="talkPill" aria-hidden="true">말하기</span>
+      </button>
+    </div>
+
+    <button id="stopBtn" class="stop" type="button" aria-label="그만. 안내를 멈춥니다"><span aria-hidden="true">그만</span></button>
+
+    <!-- 주소에 #dev가 있을 때만 보이는 개발자 화면 -->
+    <aside class="dev-panel" id="devPanel" hidden aria-label="개발자 화면">
+      <div class="stats">
+        <div class="stat"><div class="stat-label">인식 방식</div><div class="stat-value" id="modeVal">–</div></div>
+        <div class="stat"><div class="stat-label">손 인식 FPS</div><div class="stat-value" id="handFpsVal">–</div></div>
+        <div class="stat"><div class="stat-label">물체 갱신/초</div><div class="stat-value" id="objFpsVal">–</div></div>
+        <!-- 서버 요청 단계별 시간: 캡처 → 인코딩 → 요청(서버 처리 + 네트워크) -->
+        <div class="stat"><div class="stat-label">캡처</div><div class="stat-value" id="captureVal">–</div></div>
+        <div class="stat"><div class="stat-label" id="encodeLabel">인코딩</div><div class="stat-value" id="encodeVal">–</div></div>
+        <div class="stat"><div class="stat-label" id="sizeLabel">전송 크기</div><div class="stat-value" id="bytesVal">–</div></div>
+        <div class="stat"><div class="stat-label">요청</div><div class="stat-value" id="rttVal">–</div></div>
+        <div class="stat"><div class="stat-label">서버 처리</div><div class="stat-value" id="serverMsVal">–</div></div>
+        <div class="stat"><div class="stat-label">네트워크</div><div class="stat-value" id="netVal">–</div></div>
+        <div class="stat"><div class="stat-label">전체 왕복</div><div class="stat-value" id="totalVal">–</div></div>
+        <div class="stat"><div class="stat-label">요청 간격</div><div class="stat-value" id="intervalVal">–</div></div>
+        <div class="stat"><div class="stat-label">서버 장치</div><div class="stat-value" id="deviceVal">–</div></div>
+      </div>
+      <div class="timing" id="timingDetail"></div>
+
+      <section class="dev-box">
+        <h2>안내 상태</h2>
+        <pre id="guideInfo">–</pre>
+      </section>
+
+      <section class="dev-box settings" aria-label="설정">
+        <label>서버 주소 (비우면 이 페이지 주소)
+          <input id="serverInput" type="url" inputmode="url" placeholder="https://xxxx.trycloudflare.com"
+                 autocomplete="off" autocapitalize="off" spellcheck="false">
+        </label>
+        <label>API 키 (X-API-Key)
+          <input id="keyInput" type="text" autocomplete="off" autocapitalize="off" spellcheck="false">
+        </label>
+        <div class="row">
+          <label>기본 물체 (한국어 또는 영어)
+            <input id="targetInput" type="text" placeholder="컵" autocomplete="off" autocapitalize="off" spellcheck="false">
+          </label>
+          <button id="findBtn" type="button">찾기</button>
+        </div>
+        <label>전송 이미지
+          <select id="sizeSelect">
+            <option value="320">320px</option>
+            <option value="480">480px</option>
+            <option value="640" selected>640px</option>
+          </select>
+        </label>
+        <div class="row">
+          <label>음성 명령 시험 (말 대신 입력)
+            <input id="cmdInput" type="text" placeholder="컵 찾아줘" autocomplete="off" spellcheck="false">
+          </label>
+          <button id="cmdBtn" type="button">실행</button>
+        </div>
+        <div class="row2">
+          <button id="qrBtn" type="button">QR 보기</button>
+          <button id="othersBtn" type="button" aria-pressed="false">다른 물체 보기</button>
+        </div>
+      </section>
+
+      <details class="dev-box" open>
+        <summary>상태 전환 기록</summary>
+        <ol class="log" id="stateLog"></ol>
+      </details>
+      <details class="dev-box" open>
+        <summary>음성 인식 기록</summary>
+        <ol class="log" id="speechLog"></ol>
+      </details>
+      <details class="dev-box" open>
+        <summary>문장 해석 기록 (/parse)</summary>
+        <ol class="log" id="parseLog"></ol>
+      </details>
+      <details class="dev-box">
+        <summary>설명 응답 (/describe)</summary>
+        <pre id="describeOut">아직 요청하지 않았습니다</pre>
+      </details>
+      <details class="dev-box">
+        <summary>window.latestDetection</summary>
+        <pre id="output">null</pre>
+      </details>
+    </aside>
+  </div>
+
+  <div class="modal" id="qrModal" hidden role="dialog" aria-modal="true" aria-label="접속 QR 코드">
+    <div id="qrWarn" hidden></div>
+    <canvas id="qrCanvas"></canvas>
+    <div id="qrUrl"></div>
+    <button id="qrCloseBtn" type="button">닫기</button>
+  </div>
+
+<script type="module">
+// =====================================================================
+// 손 안내·음성 안내 설정값 (안내에 쓰이는 수치는 모두 여기서 조정)
+// 좌표는 손과 물체 모두 화면 기준 0~1 (후면 카메라, 좌우 반전 없음)
+// 화면 위쪽 = 사용자 기준 앞(먼 쪽), 화면 아래쪽 = 몸 쪽
+// =====================================================================
+const GUIDE_CONFIG = {
+  // ---- 발견 판정 ----
+  foundScoreOnce: 0.5,      // 이 신뢰도 이상이면 한 번만 잡혀도 "발견"
+  foundScoreMin: 0.25,      // 이 신뢰도 이상이 foundStreak번 연속 잡혀도 "발견"
+  foundStreak: 2,
+
+  // ---- 화면 가운데 맞추기 (발견 단계) ----
+  centerTolerance: 0.10,    // 박스 중심이 화면 가운데 ±10% 안이면 "정면"
+  centerRelease: 0.15,      // 정면 판정 뒤 이만큼 벗어나야 다시 좌우 안내 (경계 떨림 방지)
+  centerHoldMs: 250,        // 가운데에 이 시간 이상 머물러야 "정면에 있어요"
+
+  // ---- 거리 구간 (박스 너비 / 화면 너비). 정확한 미터는 말하지 않음 ----
+  distNearRatio: 0.35,      // 이상: "팔 닿는 거리예요"
+  distMidRatio: 0.15,       // 이상: "한두 걸음 앞이에요", 미만: "조금 멀리 있어요"
+
+  // ---- 탐색 ----
+  searchTickMs: 5000,       // "찾는 중" 효과음 간격
+  searchHintMs: 5000,       // "아직 못 찾았어요…" 시점
+  searchTimeoutMs: 30000,   // "주변에서 찾지 못했어요" 후 대기로
+
+  // ---- 물체를 놓쳤을 때 (발견·손 안내 단계) ----
+  lostTurnMs: 2000,         // 이 시간 이상 안 보이면 "폰을 천천히 ○쪽으로 돌려주세요"
+  lostTurnRepeatMs: 6000,   // 위 안내를 다시 말하는 간격
+  lostResearchMs: 10000,    // 이 시간 이상 안 보이면 탐색 단계로 복귀
+
+  // ---- 손 안내: 위치 계산 ----
+  emaAlpha: 0.4,            // 지수 이동 평균 계수 (클수록 빠르게 따라가고 덜 부드러움)
+  occludeDist: 0.15,        // 손이 목표에서 이 거리 안이면 물체가 안 보여도 "손에 가려짐"으로 봄
+  graspConfidenceWord: "high",  // grasp_point를 쓸 confidence 값
+  graspConfidenceNum: 0.8,  // confidence가 숫자로 오면 이 값 이상을 high로 봄
+  handEnterMs: 150,         // 손이 이 시간 이상 보여야 손 안내 시작 (순간 오인식 방지)
+  handLostMs: 1000,         // 손을 이 시간 이상 놓치면 비프음 멈춤 + "손이 화면에서 벗어났어요"
+
+  // ---- 손 안내: 비프음 ----
+  beepFarDist: 0.4,         // r이 이 이상이면 가장 느린 간격
+  beepNearDist: 0.05,       // r이 이 이하면 가장 빠른 간격
+  beepFarMs: 800,
+  beepNearMs: 100,
+  beepDurMs: 60,            // 비프음 길이
+  beepFreq: 880,            // 비프음 높이 (Hz)
+  hitFreq: 1760,            // 목표 범위에 들어왔을 때 높은 음
+  panRange: 0.3,            // pan = dx / panRange (-1~1로 제한)
+
+  // ---- 손 안내: 목표 범위 ----
+  targetRadius: 0.05,       // r이 이 이하이거나 검지 끝이 박스 안이면 "목표 범위 안"
+  targetExitRadius: 0.08,   // 목표 범위에서 나갈 때 기준 (경계 떨림 방지)
+
+  // ---- 손 안내: 음성 교정 ----
+  correctionMin: 0.08,      // |dx|, |dy| 중 큰 값이 이보다 클 때만 말함
+  correctionStableMs: 500,  // 같은 방향이 이 시간 이상 유지되어야 말함
+  correctionGapMs: 1500,    // 음성 교정 사이 최소 간격
+  sameRepeatMs: 3000,       // 같은 말은 이 시간 안에 반복하지 않음
+  correctionTtlMs: 1200,    // 음성 대기열에서 이 시간 넘게 기다린 교정은 버림 (낡은 안내 방지)
+
+  // ---- 잡기 성공 ----
+  graspBoxPad: 0.10,        // 박스를 사방으로 이 비율만큼 넓혀서 판정
+  graspHoldMs: 1000,        // 엄지 끝·검지 끝이 모두 박스 안에 이 시간 이상
+  doneHandGoneMs: 1000,     // 완료 후 손이 이 시간 이상 안 보이면 대기로
+
+  // ---- 소리·음성 ----
+  listenDelayMs: 500,       // 말하기 버튼을 누르고 듣기 시작까지 (TalkBack이 버튼 이름을 읽는 소리 회피)
+  listenMaxMs: 8000,        // 듣기 최대 시간 (보통은 말을 멈추면 자동 종료)
+  beepVolume: 0.35,
+  duckVolume: 0.3,          // 음성 출력 중 효과음 볼륨 배율
+  speechRate: 1.05,
+};
+const C = GUIDE_CONFIG;
+
+// 음성 출력 우선순위: 안전 경고 > 위치·손 안내 > 물체 정보·부가 한마디
+const PRIORITY = { SAFETY: 3, GUIDE: 2, INFO: 1 };
+
+// =====================================================================
+// 한국어 → 영어 물체 사전
+// 새 물건은 "한국어": "영어" 한 줄을 추가하면 됨. 같은 영어에 한국어 이름 여러 개도 가능
+// 부분 일치 허용: "커피컵" → 컵, "약병이" → 약병 (긴 이름부터 비교)
+// =====================================================================
+const OBJECT_DICT = {
+  "컵": "cup",
+  "머그컵": "mug",
+  "텀블러": "tumbler",
+  "물병": "water bottle",
+  "페트병": "plastic bottle",
+  "약병": "pill bottle",
+  "리모컨": "remote control",
+  "휴대폰": "cell phone",
+  "열쇠": "keys",
+  "안경": "glasses",
+  "지갑": "wallet",
+  "노트북": "laptop",
+  "마우스": "mouse",
+  "키보드": "keyboard",
+  "충전기": "charger",
+  "이어폰": "earphones",
+  "가방": "bag",
+  "책": "book",
+  "펜": "pen",
+  "가위": "scissors",
+  "숟가락": "spoon",
+  "그릇": "bowl",
+  "휴지": "tissue box",
+  "시계": "watch",
+  // 같은 물건의 다른 이름 (음성 인식이 이렇게 받아쓰는 경우가 많음)
+  "머그": "mug",
+  "리모콘": "remote control",
+  "핸드폰": "cell phone",
+  "스마트폰": "cell phone",
+  "티슈": "tissue box",
+  "숫가락": "spoon",
+};
+
+// =====================================================================
+// 서버·모델 설정값 (index.html과 동일)
+// =====================================================================
+const MP_VERSION = "0.10.14"; // @mediapipe/tasks-vision 버전 고정
+const MP_BUNDLE_URL = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MP_VERSION}/vision_bundle.mjs`;
+const MP_WASM_URL = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MP_VERSION}/wasm`;
+
+const OBJECT_MODEL_URL =
+  "https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/float16/1/efficientdet_lite0.tflite";
+const HAND_MODEL_URL =
+  "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task";
+
+// 서버 요청
+const SERVER_INTERVAL_MS = 300;       // 기본 요청 간격
+const STABLE_INTERVAL_MS = 1000;      // 손이 없고 물체가 연속으로 확실히 잡혔을 때 간격
+const HAND_HOLD_MS = 500;             // 손이 사라진 뒤에도 이 시간 동안은 "손 있음"으로 봄 (인식이 잠깐 끊겨도 간격이 흔들리지 않게)
+const RATE_LIMIT_INTERVAL_MS = 2000;  // 429를 받았을 때 간격
+const RETRY_INTERVAL_MS = 5000;       // 로컬 모드에서 서버 재연결 시도 간격
+const HIGH_CONF = 0.5;                // "확실히 잡힘" 기준 신뢰도
+const HIGH_CONF_STREAK = 3;           // 몇 번 연속이면 간격을 늘릴지
+const FAIL_LIMIT = 3;                 // 몇 번 연속 실패하면 로컬로 전환할지
+const SLOW_RTT_MS = 1000;             // 느린 응답 기준
+const SLOW_RTT_STREAK = 3;            // 몇 번 연속 느리면 이미지를 줄일지
+const REQUEST_TIMEOUT_MS = 2000;      // /detect 제한 시간
+const JPEG_QUALITY = 0.7;
+const IMAGE_SIZES = [320, 480, 640];  // 선택 가능한 긴 변 크기
+const SERVER_CONF = 0.25;             // 서버에 보내는 최소 신뢰도 (0.5 판단은 이 페이지에서 함)
+
+// 로컬(MediaPipe) 물체 인식
+const LOCAL_INTERVAL_MS = 300;
+const LOCAL_SCORE_THRESHOLD = 0.3;
+const LOCAL_MAX_RESULTS = 10;
+
+// VLM 설명 요청
+const DESCRIBE_PAD = 0.2;             // 박스 사방 여유 비율
+const DESCRIBE_MAX_SIDE = 1024;       // 잘라낸 이미지의 최대 긴 변
+const DESCRIBE_JPEG_QUALITY = 0.85;
+const DESCRIBE_TIMEOUT_MS = 20000;
+const DESCRIBE_RETRY_MS = 3000;       // 429·503이면 이 시간 뒤 한 번 더 시도
+const DESCRIBE_MAX_TRIES = 2;
+
+// 문장 해석 요청 (POST /parse): 단어 판별에 실패했거나 사전에 없는 물건일 때만
+const PARSE_TIMEOUT_MS = 3000;
+const PARSE_TEXT_FIELD = "text";      // 인식된 문장을 담아 보내는 JSON 필드 이름 ({"text": "..."})
+
+// MediaPipe EfficientDet(COCO) 기본 80종 라벨
+const COCO_LABELS = new Set([
+  "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck", "boat", "traffic light",
+  "fire hydrant", "stop sign", "parking meter", "bench", "bird", "cat", "dog", "horse", "sheep", "cow",
+  "elephant", "bear", "zebra", "giraffe", "backpack", "umbrella", "handbag", "tie", "suitcase", "frisbee",
+  "skis", "snowboard", "sports ball", "kite", "baseball bat", "baseball glove", "skateboard", "surfboard",
+  "tennis racket", "bottle", "wine glass", "cup", "fork", "knife", "spoon", "bowl", "banana", "apple",
+  "sandwich", "orange", "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", "chair", "couch",
+  "potted plant", "bed", "dining table", "toilet", "tv", "laptop", "mouse", "remote", "keyboard",
+  "cell phone", "microwave", "oven", "toaster", "sink", "refrigerator", "book", "clock", "vase",
+  "scissors", "teddy bear", "hair drier", "toothbrush",
+]);
+
+// 손 21개 관절 연결 정보 (MediaPipe 표준)
+const HAND_CONNECTIONS = [
+  [0, 1], [1, 2], [2, 3], [3, 4],
+  [0, 5], [5, 6], [6, 7], [7, 8],
+  [5, 9], [9, 10], [10, 11], [11, 12],
+  [9, 13], [13, 14], [14, 15], [15, 16],
+  [13, 17], [17, 18], [18, 19], [19, 20],
+  [0, 17],
+];
+
+// 캔버스 색상 (영상 위에 그리므로 테마와 무관하게 고정)
+const COLOR_TARGET = "#ffd400";
+const COLOR_OTHER = "#ffffff";
+const COLOR_HAND_LINE = "#4fd1e8";
+const COLOR_HAND_POINT = "#ffffff";
+const COLOR_INDEX_TIP = "#ff4fa3";
+const COLOR_GRASP = "#3ee07a";
+const COLOR_GUIDE = "#ff4fa3";
+const COLOR_DISCONNECT = "#e5484d";
+
+// =====================================================================
+// DOM 요소
+// =====================================================================
+const $ = (id) => document.getElementById(id);
+const els = {
+  app: $("app"), main: $("main"), startBtn: $("startBtn"), startWord: $("startWord"), startNote: $("startNote"), startWarn: $("startWarn"),
+  stateLine: $("stateLine"), caption: $("caption"), status: $("status"),
+  talkBtn: $("talkBtn"), talkPill: $("talkPill"), stopBtn: $("stopBtn"),
+  video: $("video"), canvas: $("overlay"), stage: $("stage"),
+  devPanel: $("devPanel"), guideInfo: $("guideInfo"), stateLog: $("stateLog"), speechLog: $("speechLog"), parseLog: $("parseLog"),
+  serverInput: $("serverInput"), keyInput: $("keyInput"), targetInput: $("targetInput"), sizeSelect: $("sizeSelect"),
+  findBtn: $("findBtn"), cmdInput: $("cmdInput"), cmdBtn: $("cmdBtn"), qrBtn: $("qrBtn"), othersBtn: $("othersBtn"),
+  modeVal: $("modeVal"), handFpsVal: $("handFpsVal"), objFpsVal: $("objFpsVal"),
+  rttVal: $("rttVal"), serverMsVal: $("serverMsVal"), netVal: $("netVal"),
+  intervalVal: $("intervalVal"), deviceVal: $("deviceVal"),
+  captureVal: $("captureVal"), encodeVal: $("encodeVal"), bytesVal: $("bytesVal"), sizeLabel: $("sizeLabel"),
+  totalVal: $("totalVal"), encodeLabel: $("encodeLabel"),
+  timingDetail: $("timingDetail"), output: $("output"), describeOut: $("describeOut"),
+  qrModal: $("qrModal"), qrCanvas: $("qrCanvas"), qrUrl: $("qrUrl"), qrWarn: $("qrWarn"), qrCloseBtn: $("qrCloseBtn"),
+};
+const ctx = els.canvas.getContext("2d");
+
+// =====================================================================
+// 상태
+// =====================================================================
+// 화면 입력값 (브라우저 저장소에는 저장하지 않음)
+const cfg = { server: "", key: "", targets: ["cup"], imgSize: 640 };
+let cfgVersion = 0; // 설정·찾는 물체가 바뀌면 증가. 이전 설정으로 보낸 요청의 응답은 버림
+
+let fileset = null;
+let modelsPromise = null;
+let objectModelError = "";
+const models = {
+  hand: { name: "손 인식", task: null, delegate: null, Class: null, options: null, switching: false },
+  object: { name: "로컬 물체 인식", task: null, delegate: null, Class: null, options: null, switching: false },
+};
+
+let stream = null;
+let running = false;
+let starting = false;
+let sessionId = 0; // 시작/정지할 때마다 증가. 이전 세션의 응답은 버림
+let rafId = null;
+let lastVideoTime = -1;
+let lastLocalRunAt = -Infinity;
+let micAvailable = true;
+let wakeLock = null;
+
+// 서버 통신 상태
+const srv = {
+  mode: "server",      // "server" 또는 "local"
+  inFlight: false,     // 응답 대기 중이면 새 요청을 보내지 않음
+  lastStartedAt: -Infinity, // 마지막 요청을 시작한 시각 (다음 요청 = 이 시각 + 현재 간격)
+  handSeenAt: -Infinity,    // 손이 마지막으로 보인 시각
+  failCount: 0,        // 연속 실패 횟수
+  hitStreak: 0,        // 연속으로 높은 신뢰도로 잡힌 횟수
+  rateLimited: false,  // 429를 받은 상태
+  slowCount: 0,        // 연속으로 느린 응답 횟수
+  localOnce: false,    // 503: 이번 주기만 로컬 인식 사용
+  lastCaptureMs: null, // 캡처: 영상 프레임을 캔버스에 그리는 시간
+  lastEncodeMs: null,  // 인코딩: JPEG 변환 시간 (워커/OffscreenCanvas/toDataURL)
+  lastBytes: null,     // 전송 크기: 보낸 이미지 용량(바이트)
+  lastRtt: null,       // 요청: fetch 시작부터 응답 본문까지 받은 시간
+  lastServerMs: null,  // 서버 처리: timing_ms.total
+  lastNetMs: null,     // 네트워크: 요청 - 서버 처리
+  lastTotalMs: null,   // 전체 왕복: 캡처 + 인코딩 + 요청
+  timingDetail: "",
+  device: "",
+  model: "",
+};
+
+// 마지막 물체 결과 (다음 결과가 오기 전까지 유지)
+let lastResult = emptyResult("server");
+
+const fps = { hand: { count: 0, value: 0 }, object: { count: 0, value: 0 }, windowStart: 0 };
+
+let showOthers = false;     // 로컬 모드에서 찾는 물체가 아닌 것도 흐리게 표시
+let lastDebugUpdate = 0;
+let callbackErrorShown = false;
+let devMode = false;
+let defaultTarget = null;   // URL #target 으로 받은 기본 물체 { ko, en }
+let listenText = "";        // 듣는 중 화면에 보여줄 글자
+
+window.latestDetection = null;
+
+function emptyResult(source) {
+  return { target: null, best: null, detections: [], others: [], capturedAt: 0, source };
+}
+
+// =====================================================================
+// 공통 도구
+// =====================================================================
+const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+const clamp01 = (v) => clamp(v, 0, 1);
+const pct = (v) => `${Math.round(v * 100)}%`;
+
+// 진동 (지원하지 않는 기기는 무시)
+function vibrate(pattern) {
+  try { if (navigator.vibrate) navigator.vibrate(pattern); } catch (_) { /* 무시 */ }
+}
+
+function timeStamp() {
+  const d = new Date();
+  const p = (n, w = 2) => String(n).padStart(w, "0");
+  return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}.${p(d.getMilliseconds(), 3)}`;
+}
+
+// #dev 화면 기록 목록에 한 줄 추가 (최신이 위)
+function devLog(listEl, text, max = 80) {
+  const li = document.createElement("li");
+  li.textContent = `${timeStamp()}  ${text}`;
+  listEl.prepend(li);
+  while (listEl.children.length > max) listEl.lastElementChild.remove();
+}
+
+// 받침이 있으면 a, 없으면 b (예: 컵을 / 가위를)
+function josa(word, a, b) {
+  const code = String(word || "").trim().slice(-1).charCodeAt(0);
+  if (code >= 0xac00 && code <= 0xd7a3) return (code - 0xac00) % 28 ? a : b;
+  return b;
+}
+const eulReul = (w) => `${w}${josa(w, "을", "를")}`;
+
+// 응답 값(문자열·배열·객체)을 읽을 문장으로 변환
+function toSpeech(v) {
+  if (v === null || v === undefined) return "";
+  if (typeof v === "string") return v.trim();
+  if (typeof v === "number" || typeof v === "boolean") return String(v);
+  if (Array.isArray(v)) return v.map(toSpeech).filter(Boolean).join(". ");
+  if (typeof v === "object") return Object.values(v).filter((x) => typeof x === "string").join(". ");
+  return "";
+}
+
+// =====================================================================
+// 상태/에러 표시 (화면 낭독에서 제외된 작은 줄. 경고·오류만 관객 화면에 보임)
+// =====================================================================
+// kind: info / warn / error, tag: 누가 띄운 메시지인지 (서버 메시지만 골라서 지우기 위함)
+function setStatus(text, kind = "info", tag = "") {
+  els.status.dataset.kind = kind;
+  els.status.dataset.tag = tag;
+  els.status.textContent = text;
+}
+
+function errorText(err) {
+  if (!err) return "알 수 없는 오류";
+  if (typeof err === "string") return err;
+  const name = err.name && err.name !== "Error" ? `${err.name}: ` : "";
+  return `${name}${err.message || String(err)}`;
+}
+
+function showError(err, prefix = "") {
+  console.error(prefix, err);
+  setStatus(`오류: ${prefix}${errorText(err)}`, "error");
+}
+
+window.addEventListener("error", (e) => showError(e.error || e.message));
+window.addEventListener("unhandledrejection", (e) => showError(e.reason));
+
+// =====================================================================
+// 효과음 (Web Audio)
+// =====================================================================
+const sound = (() => {
+  let ac = null;
+  let master = null;
+
+  // 첫 터치 안에서 호출해야 소리가 남 (모바일 정책)
+  function unlock() {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return;
+    if (!ac) {
+      ac = new AC();
+      master = ac.createGain();
+      master.gain.value = 1;
+      master.connect(ac.destination);
+    }
+    if (ac.state !== "running") ac.resume().catch(() => {});
+  }
+
+  // 음성 출력 중에는 효과음을 작게
+  function setDuck(on) {
+    if (!ac) return;
+    master.gain.setTargetAtTime(on ? C.duckVolume : 1, ac.currentTime, 0.03);
+  }
+
+  // 짧은 음 하나. pan: -1(왼쪽) ~ 1(오른쪽)
+  function tone({ freq, dur = 0.06, type = "sine", gain = 0.3, pan = 0, at = 0, endFreq = 0 }) {
+    if (!ac) return;
+    if (ac.state !== "running") { ac.resume().catch(() => {}); return; }
+    const t0 = ac.currentTime + 0.005 + at;
+    const osc = ac.createOscillator();
+    osc.type = type;
+    osc.frequency.setValueAtTime(freq, t0);
+    if (endFreq) osc.frequency.linearRampToValueAtTime(endFreq, t0 + dur);
+    const g = ac.createGain();
+    // 딸깍 소리가 나지 않게 짧게 올리고 내림
+    g.gain.setValueAtTime(0.0001, t0);
+    g.gain.exponentialRampToValueAtTime(gain, t0 + 0.006);
+    g.gain.setValueAtTime(gain, t0 + Math.max(0.007, dur - 0.015));
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    osc.connect(g);
+    let out = g;
+    if (pan && typeof ac.createStereoPanner === "function") {
+      const p = ac.createStereoPanner();
+      p.pan.setValueAtTime(clamp(pan, -1, 1), t0);
+      g.connect(p);
+      out = p;
+    }
+    out.connect(master);
+    osc.start(t0);
+    osc.stop(t0 + dur + 0.03);
+  }
+
+  return {
+    unlock,
+    setDuck,
+    get ready() { return Boolean(ac && ac.state === "running"); },
+    // 손 안내 비프 (손을 옮겨야 할 쪽에서 소리가 남)
+    beep(pan) { tone({ freq: C.beepFreq, dur: C.beepDurMs / 1000, type: "triangle", gain: C.beepVolume, pan }); },
+    // 목표 범위에 들어옴: 높은 음 한 번
+    hit() { tone({ freq: C.hitFreq, dur: 0.18, gain: 0.4 }); },
+    // 듣기 시작: 올라가는 두 음 / 듣기 끝: 내려가는 두 음
+    listenStart() { tone({ freq: 660, dur: 0.07, gain: 0.3 }); tone({ freq: 990, dur: 0.09, gain: 0.3, at: 0.08 }); },
+    listenEnd() { tone({ freq: 990, dur: 0.07, gain: 0.25 }); tone({ freq: 590, dur: 0.1, gain: 0.25, at: 0.08 }); },
+    // 찾는 중: 낮고 짧은 똑똑
+    searching() { tone({ freq: 520, dur: 0.04, gain: 0.22 }); tone({ freq: 520, dur: 0.04, gain: 0.22, at: 0.13 }); },
+    // 잡기 성공: 올라가는 세 음
+    success() { tone({ freq: 660, dur: 0.09, gain: 0.3 }); tone({ freq: 880, dur: 0.09, gain: 0.3, at: 0.1 }); tone({ freq: 1320, dur: 0.16, gain: 0.3, at: 0.2 }); },
+  };
+})();
+
+// =====================================================================
+// 음성 명령 판별
+// =====================================================================
+const DICT_KEYS = Object.keys(OBJECT_DICT).sort((a, b) => b.length - a.length);
+
+function koNameOf(en) {
+  return Object.keys(OBJECT_DICT).find((k) => OBJECT_DICT[k] === en) || "";
+}
+
+// 물건 이름 → { ko, en } (사전에 없으면 null)
+function lookupObject(rawName) {
+  const raw = String(rawName || "").trim();
+  if (!raw) return null;
+  // 영어로 바로 들어온 경우 (#target=cup, #dev 입력칸)
+  if (/^[a-z][a-z \-]*$/i.test(raw)) {
+    const en = raw.toLowerCase().replace(/\s+/g, " ");
+    return { ko: koNameOf(en) || en, en };
+  }
+  const name = raw.replace(/[\s.,!?~'"“”]/g, "");
+  if (OBJECT_DICT[name]) return { ko: name, en: OBJECT_DICT[name] };
+  // "내 휴대폰 좀" → "휴대폰" (앞의 소유 표현, 뒤의 조사 제거)
+  const core = name.replace(/^(내|제|우리)(?=..)/, "").replace(/(을|를|이|가|은|는|좀|도|만|하고|한번|부터)+$/, "");
+  if (OBJECT_DICT[core]) return { ko: core, en: OBJECT_DICT[core] };
+  // 부분 일치: 말한 이름 안에 사전 단어가 있음 (긴 단어부터)
+  for (const k of DICT_KEYS) if (core.includes(k)) return { ko: k, en: OBJECT_DICT[k] };
+  // 부분 일치: 사전 단어 안에 말한 이름이 있음 ("머그" → 머그컵), 한 글자는 제외
+  if (core.length >= 2) for (const k of DICT_KEYS) if (k.includes(core)) return { ko: k, en: OBJECT_DICT[k] };
+  return null;
+}
+
+// 문장 → 명령. 공백·문장부호를 없앤 뒤 단어로 판별
+function parseIntent(text) {
+  const t = String(text || "").replace(/[\s.,!?~'"“”·]/g, "");
+  if (!t) return { type: "unknown", text };
+  if (/그만|멈춰|정지/.test(t)) return { type: "stop", text };
+  const m = t.match(/^(.*?)(찾아|찾고)/);
+  if (m) {
+    const name = m[1];
+    if (!name) return { type: "find", text, name: "", object: null, empty: true };
+    return { type: "find", text, name, object: lookupObject(name), empty: false };
+  }
+  if (/어떻게잡|손잡이/.test(t)) return { type: "grasp", text };
+  if (/어디/.test(t)) return { type: "where", text };
+  return { type: "unknown", text };
+}
+
+// 음성 인식 후보 여러 개 중 판별에 성공한 것을 고름
+function chooseIntent(alts) {
+  let first = null;
+  for (const a of alts) {
+    const it = parseIntent(a.transcript);
+    if (!first) first = it;
+    if (it.type === "find" && (it.object || it.empty)) return it;
+    if (it.type === "stop" || it.type === "where" || it.type === "grasp") return it;
+  }
+  return first || { type: "unknown", text: "" };
+}
+
+// =====================================================================
+// 음성 기능 (출력 대기열 + 우선순위, 음성 인식) - 하나의 객체
+// voice.speak(text, priority, opts), voice.stopAll(), voice.onIntent(callback)
+// =====================================================================
+const NO_STT_MSG = "이 브라우저는 음성 인식을 지원하지 않아요. 크롬 사용을 권장해요";
+const REC_ERRORS = {
+  "no-speech": "말소리가 들리지 않았어요. 말하기 버튼을 누르고 다시 말씀해 주세요",
+  "audio-capture": "마이크를 사용할 수 없어요. 다른 앱이 마이크를 쓰고 있는지 확인해 주세요",
+  "not-allowed": "마이크 권한이 없어요. 브라우저 설정에서 마이크를 허용해 주세요",
+  "service-not-allowed": "이 브라우저에서는 음성 인식을 쓸 수 없어요. 크롬 사용을 권장해요",
+  "network": "인터넷 연결이 불안정해서 말씀을 알아듣지 못했어요. 다시 말씀해 주세요",
+  "language-not-supported": "한국어 음성 인식을 지원하지 않아요. 크롬 사용을 권장해요",
+  "aborted": "음성 인식이 중간에 끊겼어요. 말하기 버튼을 다시 눌러 주세요",
+  "start-failed": "음성 인식을 시작하지 못했어요. 말하기 버튼을 다시 눌러 주세요",
+  "start-timeout": "음성 인식을 시작하지 못했어요. 말하기 버튼을 다시 눌러 주세요",
+};
+
+const voice = (() => {
+  const synth = "speechSynthesis" in window ? window.speechSynthesis : null;
+  const Rec = window.SpeechRecognition || window.webkitSpeechRecognition || null;
+
+  // ---- 출력 ----
+  let koVoice = null;
+  let unlocked = false;
+  let seq = 0;
+  const queue = [];        // 우선순위 높은 순, 같으면 들어온 순
+  let current = null;      // { item, utter, timer }
+  let holdOutput = false;  // 듣는 동안은 말하지 않고 대기열에 보관
+  let pumpTimer = null;
+  let lastCancelAt = -Infinity;
+  let speakingNow = false;
+  let intentCb = null;
+
+  // ---- 듣기 ----
+  let rec = null;
+  let listenState = "off"; // off | waiting(0.5초 대기) | starting | on
+  let delayTimer = null;
+  let guardTimer = null;
+  let finals = [];
+  let interim = "";
+  let lastError = "";
+  let cancelled = false;
+
+  // 한국어 음성 자동 선택 (ko-KR + 기기 내장 음성 우선)
+  function pickVoice() {
+    if (!synth) return;
+    const ko = synth.getVoices().filter((v) => /^ko/i.test(v.lang || ""));
+    const isKr = (v) => /^ko[-_]kr/i.test(v.lang);
+    koVoice = ko.find((v) => isKr(v) && v.localService) || ko.find(isKr) || ko[0] || null;
+  }
+  if (synth) {
+    pickVoice();
+    if (typeof synth.addEventListener === "function") synth.addEventListener("voiceschanged", pickVoice);
+    else synth.onvoiceschanged = pickVoice;
+  }
+
+  // 아이폰 등은 사용자 동작 안에서 한 번 재생해야 이후 음성이 나옴
+  function unlock() {
+    if (unlocked || !synth) return;
+    unlocked = true;
+    try {
+      const u = new SpeechSynthesisUtterance(" ");
+      u.volume = 0;
+      u.lang = "ko-KR";
+      synth.speak(u);
+    } catch (_) { /* 무시 */ }
+  }
+
+  function setSpeaking(on) {
+    if (on === speakingNow) return;
+    speakingNow = on;
+    onVoiceSpeaking(on);
+  }
+
+  function cancelSynth() {
+    lastCancelAt = performance.now();
+    try { synth && synth.cancel(); } catch (_) { /* 무시 */ }
+  }
+
+  // 크롬은 cancel() 직후 바로 speak()하면 말이 씹히는 경우가 있어 잠깐 기다림
+  function schedulePump(delay = 0) {
+    const sinceCancel = performance.now() - lastCancelAt;
+    const wait = Math.max(delay, sinceCancel < 120 ? 120 - sinceCancel : 0);
+    if (pumpTimer) clearTimeout(pumpTimer);
+    pumpTimer = setTimeout(pump, wait);
+  }
+
+  function enqueue(item, front = false) {
+    let i = front
+      ? queue.findIndex((q) => q.priority <= item.priority)
+      : queue.findIndex((q) => q.priority < item.priority);
+    if (i < 0) i = queue.length;
+    queue.splice(i, 0, item);
+  }
+
+  function removeQueued(pred) {
+    for (let i = queue.length - 1; i >= 0; i--) if (pred(queue[i])) queue.splice(i, 1);
+  }
+
+  // 지금 말하는 것을 끊음. keep 표시가 있으면 대기열 맨 앞에 다시 넣음
+  function interruptCurrent() {
+    const c = current;
+    if (!c) return;
+    current = null;
+    clearTimeout(c.timer);
+    if (c.item.keep) enqueue(c.item, true);
+    cancelSynth();
+  }
+
+  function pump() {
+    pumpTimer = null;
+    if (current || holdOutput || !synth) return;
+    const now = performance.now();
+    // 너무 오래 기다린 안내(손 교정 등)는 버림
+    while (queue.length && queue[0].expiresAt < now) queue.shift();
+    const item = queue.shift();
+    if (!item) { setSpeaking(false); return; }
+
+    const u = new SpeechSynthesisUtterance(item.text);
+    u.lang = "ko-KR";
+    if (koVoice) u.voice = koVoice;
+    u.rate = C.speechRate;
+    const record = { item, utter: u, timer: 0 };
+    current = record;
+    const done = () => {
+      if (current !== record) return;
+      clearTimeout(record.timer);
+      current = null;
+      schedulePump(0);
+    };
+    u.onend = done;
+    u.onerror = (e) => {
+      if (e && e.error !== "interrupted" && e.error !== "canceled") console.warn("음성 출력 오류", e.error);
+      done();
+    };
+    // 크롬에서 끝 이벤트가 오지 않는 경우 대비 (글자 수로 넉넉하게)
+    record.timer = setTimeout(() => {
+      if (current !== record) return;
+      console.warn("음성 출력이 끝나지 않아 다음으로 넘어갑니다:", item.text);
+      current = null;
+      cancelSynth();
+      schedulePump(0);
+    }, 4000 + item.text.length * 300);
+
+    setSpeaking(true);
+    onVoiceCaption(item.text);
+    try {
+      if (synth.paused) synth.resume();
+      synth.speak(u);
+    } catch (err) {
+      console.warn("음성 출력 실패", err);
+      done();
+    }
+  }
+
+  // text: 말할 문장, priority: PRIORITY.SAFETY / GUIDE / INFO
+  // opts.group: 같은 group의 대기 중인 말은 새 말로 교체
+  // opts.ttl: 대기열에서 이 시간(ms) 넘게 기다리면 버림
+  // opts.interrupt: 같은 우선순위라도 지금 말하던 걸 끊음
+  // opts.keep: 더 높은 우선순위에 끊기면 나중에 다시 말함
+  function speak(text, priority = PRIORITY.INFO, opts = {}) {
+    const t = toSpeech(text);
+    if (!t) return;
+    const now = performance.now();
+    const item = {
+      id: ++seq, text: t, priority,
+      group: opts.group || null,
+      keep: Boolean(opts.keep),
+      expiresAt: opts.ttl ? now + opts.ttl : Infinity,
+    };
+    console.log(`[음성 출력 p${priority}] ${t}`);
+    if (!synth) { onVoiceCaption(t); return; }
+    if (item.group) removeQueued((q) => q.group === item.group);
+    enqueue(item);
+    // 우선순위가 높은 말이 오면 지금 말하던 걸 끊고 바로 말함
+    if (current && !holdOutput) {
+      const cp = current.item.priority;
+      if (priority > cp || (opts.interrupt && priority >= cp)) interruptCurrent();
+    }
+    schedulePump(0);
+  }
+
+  // 말하던 것과 대기열을 모두 지움
+  function stopSpeaking() {
+    queue.length = 0;
+    if (current) { clearTimeout(current.timer); current = null; }
+    if (synth) cancelSynth();
+    setSpeaking(false);
+  }
+
+  // 대기 중인 특정 종류의 말을 지움 (지금 말하는 것은 다시 말하지 않게만 표시)
+  function clearGroups(groups) {
+    const set = new Set(groups);
+    removeQueued((q) => set.has(q.group));
+    if (current && set.has(current.item.group)) current.item.keep = false;
+  }
+
+  // ---- 듣기 ----
+  function setListen(state) {
+    listenState = state;
+    onVoiceListenChange(state, interim);
+  }
+
+  function listen() {
+    if (!Rec) {
+      stopSpeaking();
+      speak(NO_STT_MSG, PRIORITY.GUIDE);
+      onVoiceError("이 브라우저는 음성 인식을 지원하지 않습니다. 크롬 사용 권장");
+      return;
+    }
+    // 듣는 중에 다시 누르면 지금까지 들은 말로 끝냄
+    if (listenState === "on") { try { rec && rec.stop(); } catch (_) { /* 무시 */ } return; }
+    if (listenState !== "off") return; // 0.5초 대기 중에 또 누른 것은 무시
+    stopSpeaking();          // 음성 출력 중이면 멈추고 듣기
+    holdOutput = true;       // 듣는 동안은 말하지 않음
+    cancelled = false;
+    interim = "";
+    setListen("waiting");
+    delayTimer = setTimeout(begin, C.listenDelayMs);
+  }
+
+  function begin() {
+    delayTimer = null;
+    if (cancelled) return;
+    finals = [];
+    interim = "";
+    lastError = "";
+    let r;
+    try {
+      r = new Rec();
+    } catch (err) {
+      console.warn("음성 인식 생성 실패", err);
+      lastError = "start-failed";
+      rec = null;
+      finishWithoutRec();
+      return;
+    }
+    rec = r;
+    r.lang = "ko-KR";
+    r.continuous = false;      // 말을 멈추면 자동 종료
+    r.interimResults = true;   // 듣는 중 화면에 글자 표시
+    r.maxAlternatives = 3;
+    r.onstart = () => {
+      if (rec !== r) return;
+      setListen("on");
+      sound.listenStart();
+      vibrate(40);
+      clearTimeout(guardTimer);
+      guardTimer = setTimeout(() => { try { r.stop(); } catch (_) { /* 무시 */ } }, C.listenMaxMs);
+    };
+    r.onresult = (e) => {
+      if (rec !== r) return;
+      let live = "";
+      for (let i = e.resultIndex; i < e.results.length; i++) {
+        const res = e.results[i];
+        if (res.isFinal) {
+          for (let j = 0; j < res.length; j++) finals.push({ transcript: res[j].transcript, confidence: res[j].confidence });
+        } else {
+          live += res[0].transcript;
+        }
+      }
+      interim = live;
+      onVoiceListenChange(listenState, live || (finals[0] ? finals[0].transcript : ""));
+    };
+    r.onerror = (e) => { if (rec === r) lastError = e.error || "unknown"; };
+    r.onend = () => { if (rec === r) finish(); };
+    setListen("starting");
+    clearTimeout(guardTimer);
+    guardTimer = setTimeout(() => {
+      if (rec === r && listenState === "starting") {
+        lastError = "start-timeout";
+        try { r.abort(); } catch (_) { /* 무시 */ }
+        finish();
+      }
+    }, 3000);
+    try {
+      r.start();
+    } catch (err) {
+      console.warn("음성 인식 시작 실패", err);
+      lastError = "start-failed";
+      finish();
+    }
+  }
+
+  function finishWithoutRec() {
+    setListen("off");
+    holdOutput = false;
+    reportError(lastError);
+    schedulePump(0);
+  }
+
+  function finish() {
+    const r = rec;
+    rec = null;
+    clearTimeout(guardTimer);
+    guardTimer = null;
+    if (r) r.onstart = r.onresult = r.onerror = r.onend = null;
+    const wasOn = listenState === "on";
+    setListen("off");
+    if (wasOn) { sound.listenEnd(); vibrate([20, 40, 20]); }
+    holdOutput = false;
+    if (!cancelled) {
+      const alts = finals.length ? finals : interim ? [{ transcript: interim, confidence: 0 }] : [];
+      if (alts.length) handleTranscript(alts);
+      else reportError(lastError || "no-speech");
+    }
+    interim = "";
+    schedulePump(0);
+  }
+
+  function cancelListening() {
+    if (listenState === "off") return;
+    cancelled = true;
+    if (delayTimer) { clearTimeout(delayTimer); delayTimer = null; }
+    if (rec) {
+      try { rec.abort(); } catch (_) { /* 무시 */ }
+      finish();
+    } else {
+      setListen("off");
+      holdOutput = false;
+      schedulePump(0);
+    }
+  }
+
+  // 인식 오류는 한국어로 풀어서 말하고 화면에도 표시
+  function reportError(code) {
+    const msg = REC_ERRORS[code] || "음성 인식에 문제가 생겼어요. 말하기 버튼을 다시 눌러 주세요";
+    speak(msg, PRIORITY.GUIDE, { group: "reply" });
+    onVoiceError(`음성 인식 오류 (${code}): ${msg}`);
+    onVoiceLog({ error: code });
+  }
+
+  function handleTranscript(alts) {
+    const intent = chooseIntent(alts);
+    onVoiceLog({ alts, intent });
+    if (!intentCb) return;
+    try { intentCb(intent); } catch (err) { showError(err, "음성 명령 처리 중 "); }
+  }
+
+  return {
+    speak,
+    // 모든 음성 기능 중지 (듣기 취소 + 출력·대기열 비우기)
+    stopAll() { cancelListening(); stopSpeaking(); },
+    onIntent(cb) { intentCb = cb; },
+    listen,
+    stopSpeaking,
+    cancelListening,
+    clearGroups,
+    unlock,
+    // #dev: 말 대신 글자로 명령 시험
+    simulate(text) { handleTranscript([{ transcript: String(text || ""), confidence: 1 }]); },
+    isListening: () => listenState !== "off",
+    isSpeaking: () => Boolean(current) || (queue.length > 0 && !holdOutput),
+    queueLength: () => queue.length,
+    supported: { tts: Boolean(synth), stt: Boolean(Rec) },
+  };
+})();
+
+// 음성 객체 → 화면 연결
+function onVoiceListenChange(state, text) {
+  document.body.dataset.listen = state;
+  els.talkPill.textContent = state === "on" ? "듣는 중" : state === "off" ? "말하기" : "잠시만요";
+  listenText = state === "off" ? "" : text || "";
+  renderStateLine();
+}
+function onVoiceCaption(text) { els.caption.textContent = text; }
+function onVoiceSpeaking(on) { sound.setDuck(on); }
+function onVoiceError(msg) { setStatus(msg, "warn", "voice"); }
+function onVoiceLog(entry) {
+  if (entry.error) {
+    devLog(els.speechLog, `오류: ${entry.error}`);
+    return;
+  }
+  const alts = entry.alts.map((a) => `“${a.transcript}”${a.confidence ? ` ${Math.round(a.confidence * 100)}%` : ""}`).join(" / ");
+  const it = entry.intent;
+  let what = it.type;
+  if (it.type === "find") what = it.empty ? "find (이름 없음)" : `find ${it.name} → ${it.object ? it.object.en : "사전에 없음"}`;
+  devLog(els.speechLog, `${alts}  ⇒ ${what}`);
+  console.log("[음성 인식]", entry.alts, "⇒", it);
+}
+
+// =====================================================================
+// 브라우저 확인: 크롬이 아니거나 필요한 기능이 없으면 안내 (시작 화면 + 화면 낭독용 이름)
+// =====================================================================
+function checkBrowser() {
+  const missing = [];
+  if (!window.isSecureContext) missing.push("HTTPS 연결");
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) missing.push("카메라");
+  if (typeof WebAssembly !== "object") missing.push("WebAssembly");
+  if (!window.fetch || !window.AbortController || !window.FormData) missing.push("서버 통신");
+  if (!voice.supported.tts) missing.push("음성 출력");
+  if (!voice.supported.stt) missing.push("음성 인식");
+
+  const ua = navigator.userAgent;
+  const brands = (navigator.userAgentData && navigator.userAgentData.brands || []).map((b) => b.brand);
+  // 카카오톡·인스타그램 등 앱 안 브라우저는 크롬이 아님
+  const inApp = /KAKAOTALK|Instagram|FBAN|FBAV|NAVER|Line\/|; wv\)/i.test(ua);
+  let isChrome;
+  if (brands.length) isChrome = brands.includes("Google Chrome");
+  else isChrome = /CriOS/.test(ua) || (/Chrome\/\d+/.test(ua) && !/Edg|OPR|SamsungBrowser|Whale|YaBrowser/.test(ua));
+  if (inApp) isChrome = false;
+
+  if (isChrome && missing.length === 0) return;
+  let msg = "크롬 사용 권장.";
+  if (inApp) msg += " 앱 안에서 열렸다면 메뉴에서 '다른 브라우저로 열기'를 눌러 주세요.";
+  if (missing.length) msg += ` 이 브라우저에서 사용할 수 없는 기능: ${missing.join(", ")}`;
+  els.startWarn.textContent = msg;
+  els.startWarn.hidden = false;
+  els.startBtn.setAttribute("aria-label", "시작. 카메라와 음성 안내를 켭니다. 크롬 사용을 권장합니다");
+}
+
+// =====================================================================
+// 설정 입력 (URL # 뒤 값으로 자동 입력)
+// =====================================================================
+function normalizeServer(v) {
+  let s = (v || "").trim().replace(/\/+$/, "");
+  if (s && !/^https?:\/\//i.test(s)) s = `https://${s}`;
+  // 서버 주소를 비워두면, 이 페이지를 제공한 서버(같은 주소)를 사용
+  if (!s && /^https?:$/.test(location.protocol)) s = location.origin;
+  return s;
+}
+
+// 서버 주소·키·이미지 크기 읽기 (찾는 물체는 음성 명령으로 정함)
+function readConfig() {
+  const before = `${cfg.server}|${cfg.key}`;
+  cfg.server = normalizeServer(els.serverInput.value);
+  cfg.key = els.keyInput.value.trim();
+  const size = Number(els.sizeSelect.value);
+  cfg.imgSize = IMAGE_SIZES.includes(size) ? size : 640;
+  const after = `${cfg.server}|${cfg.key}`;
+
+  if (before !== after) {
+    cfgVersion++;
+    resetObjectState();
+  }
+  // HTTPS 페이지에서는 http 서버에 요청할 수 없음 (혼합 콘텐츠 차단)
+  if (location.protocol === "https:" && /^http:\/\//i.test(cfg.server) && !/^http:\/\/(localhost|127\.0\.0\.1)/i.test(cfg.server)) {
+    setStatus("HTTPS 페이지에서는 http:// 서버에 연결할 수 없습니다. 서버 주소를 https://로 바꿔 주세요", "warn", "server");
+  }
+  renderStats();
+}
+
+// 관객 화면에서 API 키가 없을 때 안내 문구
+function missingKeyNotice() {
+  return !devMode && !cfg.key ? "API 키가 없습니다. 발표 화면의 QR 코드를 다시 찍어서 접속해 주세요." : "";
+}
+
+// 주소 # 뒤: dev(개발자 화면), key(API 키), target(기본 물체, 한국어 또는 영어), server, size
+function applyHash() {
+  const p = new URLSearchParams(location.hash.replace(/^#/, ""));
+  devMode = p.has("dev"); // #dev, #key=...&dev 모두 인식
+  document.body.classList.toggle("dev", devMode);
+  els.devPanel.hidden = !devMode;
+  if (p.has("server")) els.serverInput.value = p.get("server");
+  if (p.has("key")) els.keyInput.value = p.get("key");
+  if (p.has("target")) els.targetInput.value = p.get("target");
+  if (p.has("size") && IMAGE_SIZES.includes(Number(p.get("size")))) els.sizeSelect.value = p.get("size");
+  updateDefaultTarget();
+  readConfig();
+  const notice = missingKeyNotice();
+  if (notice) setStatus(notice, "warn");
+  requestAnimationFrame(fitStage);
+}
+
+function updateDefaultTarget() {
+  const v = els.targetInput.value.split(",")[0].trim();
+  defaultTarget = v ? lookupObject(v) : null;
+}
+
+// 찾는 물체가 바뀌거나 새로 시작할 때 물체 인식 상태 초기화
+function resetObjectState() {
+  srv.mode = cfg.server ? "server" : "local";
+  srv.lastStartedAt = -Infinity;
+  srv.failCount = 0;
+  srv.hitStreak = 0;
+  srv.rateLimited = false;
+  srv.slowCount = 0;
+  srv.localOnce = false;
+  lastResult = emptyResult(srv.mode);
+  lastLocalRunAt = -Infinity;
+  if (els.status.dataset.tag === "server") setStatus("");
+  if (running && srv.mode === "local" && detectionActive()) showLocalModeStatus("서버 주소가 없어 로컬 인식을 사용합니다");
+}
+
+// =====================================================================
+// 모델 로딩 (GPU 시도 → 실패 시 CPU)
+// =====================================================================
+async function createTask(model, delegates = ["GPU", "CPU"]) {
+  let lastErr = null;
+  for (const delegate of delegates) {
+    try {
+      model.task = await model.Class.createFromOptions(fileset, {
+        ...model.options,
+        baseOptions: { ...model.options.baseOptions, delegate },
+      });
+      model.delegate = delegate;
+      return;
+    } catch (err) {
+      lastErr = err;
+      console.warn(`${model.name}: ${delegate} 생성 실패`, err);
+    }
+  }
+  throw new Error(`${model.name} 모델 생성 실패 (${errorText(lastErr)})`);
+}
+
+async function loadModels() {
+  const vision = await import(MP_BUNDLE_URL);
+  fileset = await vision.FilesetResolver.forVisionTasks(MP_WASM_URL);
+
+  models.hand.Class = vision.HandLandmarker;
+  models.hand.options = {
+    baseOptions: { modelAssetPath: HAND_MODEL_URL },
+    runningMode: "VIDEO",
+    numHands: 1,
+  };
+  models.object.Class = vision.ObjectDetector;
+  models.object.options = {
+    baseOptions: { modelAssetPath: OBJECT_MODEL_URL },
+    runningMode: "VIDEO",
+    scoreThreshold: LOCAL_SCORE_THRESHOLD,
+    maxResults: LOCAL_MAX_RESULTS,
+  };
+
+  // 손 인식은 필수, 로컬 물체 인식은 대체용이라 실패해도 계속 진행
+  const [hand, object] = await Promise.allSettled([createTask(models.hand), createTask(models.object)]);
+  if (hand.status === "rejected") throw hand.reason;
+  objectModelError = object.status === "rejected" ? errorText(object.reason) : "";
+  renderStats();
+}
+
+function ensureModels() {
+  if (!modelsPromise) {
+    modelsPromise = loadModels().catch((err) => {
+      modelsPromise = null; // 다음에 시작 버튼을 누르면 다시 시도
+      throw err;
+    });
+  }
+  return modelsPromise;
+}
+
+// 실행 중 GPU 오류가 나면 해당 모델만 CPU로 다시 생성
+function handleRuntimeError(kind, err) {
+  const model = models[kind];
+  if (model.delegate === "GPU" && !model.switching) {
+    console.warn(`${model.name}: GPU 실행 오류 → CPU로 전환`, err);
+    model.switching = true;
+    const old = model.task;
+    model.task = null;
+    try { old && old.close(); } catch (_) { /* 무시 */ }
+    createTask(model, ["CPU"])
+      .then(() => {
+        model.switching = false;
+        renderStats();
+        setStatus(`${model.name}: GPU 실행 오류로 CPU로 전환했습니다`, "warn");
+      })
+      .catch((e) => {
+        model.switching = false;
+        if (kind === "hand") fatal(e, "손 인식을 계속할 수 없어요. ");
+        else { objectModelError = errorText(e); showError(e); }
+      });
+    return;
+  }
+  if (kind === "hand") {
+    fatal(err, "손 인식을 계속할 수 없어요. ", `${model.name} 실행 중 `);
+  } else {
+    // 로컬 물체 인식은 대체용이므로 끄고 계속 진행
+    try { model.task && model.task.close(); } catch (_) { /* 무시 */ }
+    model.task = null;
+    objectModelError = errorText(err);
+    showError(err, `${model.name} 실행 중 (로컬 물체 인식 중단) `);
+  }
+}
+
+// =====================================================================
+// 시작 (첫 터치: 소리·음성 → 카메라·마이크 권한 → 모델)
+// =====================================================================
+// 카메라와 마이크 권한을 한 번에 받음. 마이크 트랙은 바로 끔 (음성 인식이 마이크를 따로 씀)
+async function openCamera() {
+  const video = { facingMode: { ideal: "environment" }, width: { ideal: 1280 }, height: { ideal: 720 } };
+  try {
+    const s = await navigator.mediaDevices.getUserMedia({ video, audio: true });
+    for (const t of s.getAudioTracks()) { t.stop(); s.removeTrack(t); }
+    return { stream: s, mic: true };
+  } catch (err) {
+    console.warn("카메라+마이크 요청 실패 → 카메라만 다시 요청", err);
+    const s = await navigator.mediaDevices.getUserMedia({ video, audio: false });
+    return { stream: s, mic: false };
+  }
+}
+
+function startErrorSpeech(err) {
+  const name = err && err.name;
+  if (name === "NotAllowedError" || name === "SecurityError") return "카메라 권한이 없어서 시작하지 못했어요. 브라우저 설정에서 카메라를 허용해 주세요";
+  if (name === "NotFoundError" || name === "OverconstrainedError") return "카메라를 찾을 수 없어서 시작하지 못했어요";
+  if (name === "NotReadableError") return "다른 앱이 카메라를 쓰고 있어서 시작하지 못했어요";
+  if (/모델/.test(errorText(err))) return "인식 모델을 불러오지 못했어요. 인터넷 연결을 확인하고 시작 버튼을 다시 눌러 주세요";
+  return "시작하지 못했어요. 시작 버튼을 다시 눌러 주세요";
+}
+
+async function start() {
+  if (starting || running) return;
+  starting = true;
+  // 사용자 터치 안에서 바로 소리·음성 활성화 (모바일 정책)
+  sound.unlock();
+  voice.unlock();
+  els.startWord.textContent = "준비 중";
+  els.startNote.textContent = "카메라와 마이크 사용을 허용해 주세요";
+  try {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      throw new Error("카메라를 사용할 수 없습니다. HTTPS 또는 localhost 주소로 열었는지 확인하세요.");
+    }
+    const cam = await openCamera();
+    stream = cam.stream;
+    micAvailable = cam.mic;
+    els.video.srcObject = stream;
+    await els.video.play();
+    fitStage();
+
+    // 시작 화면을 닫고 말하기 버튼으로 초점 이동
+    els.startBtn.hidden = true;
+    els.app.inert = false;
+    els.talkBtn.focus({ preventScroll: true });
+    const shownAt = performance.now();
+    keepAwake();
+
+    if (!models.hand.task) {
+      renderStateLine("준비 중");
+      setStatus("모델 불러오는 중…");
+    }
+    await ensureModels();
+
+    sessionId++;
+    readConfig();
+    resetObjectState();
+    srv.inFlight = false;
+    lastVideoTime = -1;
+    fps.hand.count = fps.object.count = 0;
+    fps.hand.value = fps.object.value = 0;
+    fps.windowStart = performance.now();
+
+    running = true;
+    setState(S.IDLE, "준비 완료");
+    if (objectModelError) setStatus(`로컬 대체 모델 없음: ${objectModelError}`, "warn");
+    else setStatus("");
+    if (missingKeyNotice()) setStatus(missingKeyNotice(), "warn", "server");
+    rafId = requestAnimationFrame(loop);
+
+    // 화면 낭독기가 버튼 이름을 읽는 것과 겹치지 않게 조금 기다렸다가 안내
+    const wait = Math.max(0, 900 - (performance.now() - shownAt));
+    setTimeout(() => {
+      if (!running) return;
+      voice.speak("준비됐어요. 말하기 버튼을 누르고 찾을 물건을 말씀해 주세요", PRIORITY.INFO, { group: "reply" });
+      if (!voice.supported.stt) voice.speak(NO_STT_MSG, PRIORITY.INFO);
+      else if (!micAvailable) voice.speak("마이크 권한이 없으면 음성 명령을 쓸 수 없어요. 브라우저 설정에서 마이크를 허용해 주세요", PRIORITY.INFO);
+    }, wait);
+  } catch (err) {
+    stop();
+    showError(err, "시작 실패 - ");
+    voice.speak(startErrorSpeech(err), PRIORITY.GUIDE);
+  } finally {
+    starting = false;
+  }
+}
+
+// 카메라를 끄고 시작 화면으로 (치명적 오류일 때)
+function stop() {
+  running = false;
+  sessionId++; // 진행 중인 서버 응답은 무시됨
+  srv.inFlight = false;
+  if (rafId) cancelAnimationFrame(rafId);
+  rafId = null;
+  if (stream) stream.getTracks().forEach((t) => t.stop());
+  stream = null;
+  els.video.srcObject = null;
+  ctx.clearRect(0, 0, els.canvas.width, els.canvas.height);
+  window.latestDetection = null;
+  els.output.textContent = "null";
+  voice.stopAll();
+  app.task = null;
+  if (app.state !== S.BOOT) setState(S.BOOT, "정지");
+  if (wakeLock) { wakeLock.release().catch(() => {}); wakeLock = null; }
+  // 시작 화면 다시 표시
+  els.app.inert = true;
+  els.startWord.textContent = "시작";
+  els.startNote.textContent = "다시 시작하려면 누르세요";
+  els.startBtn.hidden = false;
+  els.startBtn.focus({ preventScroll: true });
+}
+
+function fatal(err, speech, prefix = "") {
+  stop();
+  showError(err, prefix);
+  voice.speak(`${speech}시작 버튼을 다시 눌러 주세요`, PRIORITY.SAFETY);
+}
+
+// 화면이 꺼지지 않게 (지원하는 브라우저만)
+async function keepAwake() {
+  try {
+    if ("wakeLock" in navigator && document.visibilityState === "visible") {
+      wakeLock = await navigator.wakeLock.request("screen");
+    }
+  } catch (_) { /* 무시 */ }
+}
+
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") {
+    if (running) {
+      keepAwake();
+      sound.unlock();
+      if (els.video.paused) els.video.play().catch(() => {});
+    }
+  } else {
+    // 다른 앱으로 넘어가면 말하기·듣기를 멈춤
+    voice.cancelListening();
+    voice.stopSpeaking();
+  }
+});
+
+// =====================================================================
+// 화면 크기 맞추기 (스테이지를 영상 비율대로 가운데 영역 안에 꽉 차게)
+// 정규화 좌표 0~1이 화면 위 영상 영역과 정확히 일치
+// =====================================================================
+function fitStage() {
+  const vw = els.video.videoWidth || 3;
+  const vh = els.video.videoHeight || 4;
+  const box = els.main.getBoundingClientRect();
+  const scale = Math.min(box.width / vw, box.height / vh);
+  els.stage.style.width = `${Math.max(0, Math.floor(vw * scale))}px`;
+  els.stage.style.height = `${Math.max(0, Math.floor(vh * scale))}px`;
+}
+new ResizeObserver(fitStage).observe(els.main);
+els.video.addEventListener("loadedmetadata", fitStage);
+
+// =====================================================================
+// 메인 루프
+// =====================================================================
+function loop() {
+  if (!running) return;
+  rafId = requestAnimationFrame(loop);
+  const video = els.video;
+  if (video.readyState < 2 || !video.videoWidth) return;
+  if (video.currentTime === lastVideoTime) return; // 새 프레임이 아니면 건너뜀
+  lastVideoTime = video.currentTime;
+  try {
+    processFrame(video, performance.now());
+  } catch (err) {
+    fatal(err, "문제가 생겨 안내를 멈췄어요. ", "프레임 처리 중 ");
+  }
+}
+
+function processFrame(video, now) {
+  const W = video.videoWidth;
+  const H = video.videoHeight;
+  if (els.canvas.width !== W || els.canvas.height !== H) {
+    els.canvas.width = W;
+    els.canvas.height = H;
+    fitStage();
+  }
+
+  // ---- 1) 손 인식: 매 프레임 ----
+  let hand = null;
+  let handLandmarks = null;
+  const hm = models.hand;
+  if (hm.task && !hm.switching) {
+    try {
+      const res = hm.task.detectForVideo(video, now);
+      fps.hand.count++;
+      if (res.landmarks && res.landmarks.length > 0) {
+        handLandmarks = res.landmarks[0];
+        hand = buildHand(handLandmarks);
+        srv.handSeenAt = now;
+      }
+    } catch (err) {
+      handleRuntimeError("hand", err);
+      return;
+    }
+  }
+
+  // ---- 2) 서버 요청: 탐색·발견·손 안내 단계에서만. 응답을 기다리지 않고 루프는 계속 ----
+  // 간격은 매 프레임 다시 계산하므로, 1초 간격 중에 손이 나타나면 바로 0.3초 간격으로 바뀜
+  const active = detectionActive();
+  if (active && cfg.server && !srv.inFlight && now >= srv.lastStartedAt + currentInterval(now)) requestDetect(video);
+
+  // ---- 3) 로컬 인식: 로컬 모드이거나 503을 받은 주기 ----
+  if (!active) srv.localOnce = false;
+  else if (srv.localOnce || (srv.mode === "local" && now - lastLocalRunAt >= LOCAL_INTERVAL_MS)) {
+    srv.localOnce = false;
+    runLocal(video, now, W, H);
+  }
+
+  updateFps(now);
+
+  // ---- 4) 상태 머신·손 안내 ----
+  try {
+    tickApp(now, hand);
+  } catch (err) {
+    // 안내 계산 오류로 카메라까지 멈추지 않게 기록만 함
+    console.error("안내 처리 오류", err);
+    showError(err, "안내 처리 중 ");
+  }
+
+  // ---- 5) 출력 데이터 ----
+  const r = lastResult;
+  const detection = {
+    timestamp: now, // performance.now() 기준 ms
+    state: app.state,
+    target: r.target,
+    cup: r.target, // 기존 코드 호환용
+    hand,
+    fps: { hand: fps.hand.value, object: fps.object.value },
+    objectSource: r.source,
+    objectAgeMs: r.capturedAt ? Math.round(now - r.capturedAt) : null,
+  };
+  window.latestDetection = detection;
+
+  if (typeof window.onDetection === "function") {
+    try {
+      window.onDetection(detection);
+    } catch (err) {
+      console.error("onDetection 콜백 오류", err);
+      if (!callbackErrorShown) {
+        callbackErrorShown = true;
+        showError(err, "onDetection 콜백 - ");
+      }
+    }
+  }
+
+  // ---- 6) 그리기 ----
+  draw(handLandmarks, now);
+  updateDebug(detection, now);
+}
+
+// =====================================================================
+// 서버 물체 인식 (POST /detect)
+// =====================================================================
+// 손이 화면에 보이는지 (잠깐 끊긴 경우도 보이는 것으로 침)
+function isHandVisible(now = performance.now()) {
+  return now - srv.handSeenAt <= HAND_HOLD_MS;
+}
+
+// 요청 간격 규칙
+// - 로컬 모드: 5초마다 서버 재연결 시도
+// - 429를 받은 상태: 2초
+// - 손이 없고, 찾는 물체가 연속 3번 확실히(0.5 이상) 잡힘: 1초
+// - 그 외 (손이 보이거나, 물체를 놓쳤거나, 아직 안정적이지 않음): 0.3초
+function currentInterval(now = performance.now()) {
+  if (srv.mode === "local") return RETRY_INTERVAL_MS;
+  if (srv.rateLimited) return RATE_LIMIT_INTERVAL_MS;
+  const stable = srv.hitStreak >= HIGH_CONF_STREAK;
+  return stable && !isHandVisible(now) ? STABLE_INTERVAL_MS : SERVER_INTERVAL_MS;
+}
+
+// =====================================================================
+// JPEG 인코더
+// canvas.toBlob()은 크롬에서 메인 스레드가 한가할 때 인코딩하도록 미뤄짐.
+// 손 인식이 매 프레임 메인 스레드를 쓰면 한가한 때가 없어 수 초씩 지연됨.
+// 그래서 아래 순서로 지원되는 방식을 고르고, 실패하면 다음 방식으로 자동 전환
+//   1) worker    : 프레임을 ImageBitmap으로 워커에 넘겨 OffscreenCanvas.convertToBlob()
+//   2) offscreen : 메인 스레드의 OffscreenCanvas.convertToBlob()
+//   3) dataurl   : canvas.toDataURL()로 바로 변환한 뒤 Blob으로 바꿈
+// =====================================================================
+const ENCODE_TIMEOUT_MS = 2000; // 이 시간 안에 인코딩이 끝나지 않으면 다음 방식으로 전환
+const ENCODER_LABELS = { worker: "워커", offscreen: "Offscreen", dataurl: "toDataURL" };
+
+// 워커 코드 (HTML 파일 하나로 동작하도록 문자열로 넣고 Blob URL로 실행)
+const ENCODER_WORKER_SOURCE = `
+let canvas = null;
+let ctx = null;
+self.onmessage = async (e) => {
+  const { id, bitmap, quality } = e.data;
+  try {
+    if (!canvas) {
+      canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
+      ctx = canvas.getContext("2d");
+      if (!ctx) throw new Error("워커에서 OffscreenCanvas 2d를 사용할 수 없음");
+    }
+    if (canvas.width !== bitmap.width || canvas.height !== bitmap.height) {
+      canvas.width = bitmap.width;
+      canvas.height = bitmap.height;
+    }
+    ctx.drawImage(bitmap, 0, 0);
+    bitmap.close();
+    const blob = await canvas.convertToBlob({ type: "image/jpeg", quality });
+    self.postMessage({ id, blob });
+  } catch (err) {
+    try { bitmap.close(); } catch (_) {}
+    self.postMessage({ id, error: String((err && err.message) || err) });
+  }
+};
+`;
+
+const encoder = {
+  mode: "dataurl",
+  worker: null,
+  pending: new Map(), // 워커 응답을 기다리는 요청들 (id → { resolve, reject, timer })
+  nextId: 1,
+  offscreen: null,    // 메인 스레드에서 프레임을 그리는 OffscreenCanvas
+  offscreenCtx: null,
+  canvas: null,       // OffscreenCanvas가 없을 때 쓰는 일반 캔버스
+  canvasCtx: null,
+};
+
+function supportsOffscreen2d() {
+  try {
+    return typeof OffscreenCanvas !== "undefined"
+      && typeof OffscreenCanvas.prototype.convertToBlob === "function"
+      && Boolean(new OffscreenCanvas(1, 1).getContext("2d"));
+  } catch (_) {
+    return false;
+  }
+}
+
+function initEncoder() {
+  if (supportsOffscreen2d()) {
+    encoder.offscreen = new OffscreenCanvas(1, 1);
+    encoder.offscreenCtx = encoder.offscreen.getContext("2d");
+    const canUseWorker = typeof Worker !== "undefined"
+      && typeof OffscreenCanvas.prototype.transferToImageBitmap === "function";
+    if (canUseWorker) {
+      try {
+        const url = URL.createObjectURL(new Blob([ENCODER_WORKER_SOURCE], { type: "text/javascript" }));
+        encoder.worker = new Worker(url);
+        encoder.worker.onmessage = onEncoderMessage;
+        encoder.worker.onerror = (e) => downgradeEncoder("worker", `워커 오류: ${e.message || "알 수 없음"}`);
+        encoder.mode = "worker";
+        return;
+      } catch (err) {
+        console.warn("인코딩 워커 생성 실패", err);
+      }
+    }
+    encoder.mode = "offscreen";
+    return;
+  }
+  setupCanvasEncoder();
+}
+
+function setupCanvasEncoder() {
+  encoder.canvas = document.createElement("canvas");
+  encoder.canvasCtx = encoder.canvas.getContext("2d");
+  encoder.mode = "dataurl";
+}
+
+// 현재 방식이 실패하면 다음 방식으로 내림 (worker → offscreen → dataurl)
+function downgradeEncoder(fromMode, reason) {
+  if (encoder.mode !== fromMode) return; // 이미 다른 요청이 전환함
+  if (fromMode === "worker") {
+    try { encoder.worker.terminate(); } catch (_) { /* 무시 */ }
+    encoder.worker = null;
+    for (const p of encoder.pending.values()) {
+      clearTimeout(p.timer);
+      p.reject(new Error("인코딩 워커 종료"));
+    }
+    encoder.pending.clear();
+    encoder.mode = "offscreen";
+  } else if (fromMode === "offscreen") {
+    setupCanvasEncoder();
+  } else {
+    return;
+  }
+  console.warn(`JPEG 인코딩 방식 전환: ${fromMode} → ${encoder.mode}`, reason);
+  setStatus(`JPEG 인코딩 방식을 ${ENCODER_LABELS[encoder.mode]}(으)로 바꿨습니다: ${reason}`, "info");
+  renderStats();
+}
+
+function onEncoderMessage(e) {
+  const { id, blob, error } = e.data || {};
+  const p = encoder.pending.get(id);
+  if (!p) return;
+  clearTimeout(p.timer);
+  encoder.pending.delete(id);
+  if (error) p.reject(new Error(error));
+  else p.resolve(blob);
+}
+
+function encodeInWorker(bitmap, quality) {
+  return new Promise((resolve, reject) => {
+    const id = encoder.nextId++;
+    const timer = setTimeout(() => {
+      encoder.pending.delete(id);
+      reject(new Error(`워커 인코딩 시간 초과 (${ENCODE_TIMEOUT_MS / 1000}초)`));
+    }, ENCODE_TIMEOUT_MS);
+    encoder.pending.set(id, { resolve, reject, timer });
+    encoder.worker.postMessage({ id, bitmap, quality }, [bitmap]); // 복사 없이 넘김
+  });
+}
+
+function withTimeout(promise, ms, message) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(message)), ms);
+    promise.then(
+      (v) => { clearTimeout(timer); resolve(v); },
+      (e) => { clearTimeout(timer); reject(e); }
+    );
+  });
+}
+
+function dataUrlToBlob(dataUrl) {
+  const comma = dataUrl.indexOf(",");
+  const mime = (dataUrl.slice(0, comma).match(/data:([^;]+)/) || [])[1] || "image/jpeg";
+  const binary = atob(dataUrl.slice(comma + 1));
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return new Blob([bytes], { type: mime });
+}
+
+// width×height 캔버스에 draw(ctx)로 그린 뒤 JPEG Blob으로 변환
+// 반환: { blob, drawnAt(그린 시각), captureMs(그리기 시간), encodeMs(인코딩 시간), method }
+async function encodeJpeg(width, height, draw, quality) {
+  const mode = encoder.mode;
+  const t0 = performance.now();
+
+  if (mode === "worker" || mode === "offscreen") {
+    const c = encoder.offscreen;
+    if (c.width !== width || c.height !== height) { c.width = width; c.height = height; }
+    draw(encoder.offscreenCtx);
+    const drawnAt = performance.now();
+    try {
+      let blob;
+      if (mode === "worker") {
+        // 그린 결과를 ImageBitmap으로 떼어내 워커로 보냄 (메인 스레드는 바로 다음 일로)
+        blob = await encodeInWorker(c.transferToImageBitmap(), quality);
+      } else {
+        blob = await withTimeout(
+          c.convertToBlob({ type: "image/jpeg", quality }),
+          ENCODE_TIMEOUT_MS,
+          `OffscreenCanvas 인코딩 시간 초과 (${ENCODE_TIMEOUT_MS / 1000}초)`
+        );
+      }
+      return { blob, drawnAt, captureMs: drawnAt - t0, encodeMs: performance.now() - drawnAt, method: mode };
+    } catch (err) {
+      downgradeEncoder(mode, errorText(err));
+      return encodeJpeg(width, height, draw, quality); // 다음 방식으로 다시 그려서 인코딩
+    }
+  }
+
+  // dataurl: 동기 변환이라 미뤄지지 않음 (대신 변환하는 동안 메인 스레드를 잠깐 씀)
+  const c = encoder.canvas;
+  if (c.width !== width || c.height !== height) { c.width = width; c.height = height; }
+  draw(encoder.canvasCtx);
+  const drawnAt = performance.now();
+  const blob = dataUrlToBlob(c.toDataURL("image/jpeg", quality));
+  return { blob, drawnAt, captureMs: drawnAt - t0, encodeMs: performance.now() - drawnAt, method: "dataurl" };
+}
+
+// 현재 화면을 긴 변 longSide로 줄여 JPEG로 변환하고, 단계별 시간을 함께 돌려줌
+async function captureFrame(video, longSide) {
+  const vw = video.videoWidth;
+  const vh = video.videoHeight;
+  const scale = Math.min(1, longSide / Math.max(vw, vh)); // 확대는 하지 않음
+  const w = Math.round(vw * scale);
+  const h = Math.round(vh * scale);
+  const r = await encodeJpeg(w, h, (c) => c.drawImage(video, 0, 0, w, h), JPEG_QUALITY);
+  // capturedAt: 사진을 찍은 시각 (objectAgeMs 계산용)
+  return { blob: r.blob, capturedAt: r.drawnAt, captureMs: r.captureMs, encodeMs: r.encodeMs };
+}
+
+// multipart POST + 제한 시간. 응답 본문은 텍스트로 받고 JSON이면 파싱
+// 페이지를 열 때마다 새로 만드는 기기 ID (브라우저 저장소에는 저장하지 않음)
+const CLIENT_ID = (crypto.randomUUID ? crypto.randomUUID() : String(Math.random()).slice(2) + Date.now());
+
+// JSON POST + 제한 시간 (/parse용). 헤더·오류 처리는 postForm과 같음
+async function postJson(url, data, timeoutMs) {
+  const ac = new AbortController();
+  let timedOut = false;
+  const timer = setTimeout(() => { timedOut = true; ac.abort(); }, timeoutMs);
+  try {
+    const headers = { "Content-Type": "application/json", "X-Client-Id": CLIENT_ID };
+    if (cfg.key) headers["X-API-Key"] = cfg.key;
+    const res = await fetch(url, { method: "POST", headers, body: JSON.stringify(data), signal: ac.signal, cache: "no-store" });
+    const text = await res.text();
+    let body = null;
+    try { body = text ? JSON.parse(text) : null; } catch (_) { body = null; }
+    return { res, body, text };
+  } catch (err) {
+    if (timedOut) throw new Error(`시간 초과 (${timeoutMs / 1000}초)`);
+    throw new Error(`네트워크 오류: ${errorText(err)} (서버 주소, 서버 CORS 설정, 인터넷 연결 확인)`);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function postForm(url, formData, timeoutMs) {
+  const ac = new AbortController();
+  let timedOut = false;
+  const timer = setTimeout(() => { timedOut = true; ac.abort(); }, timeoutMs);
+  try {
+    // X-Client-Id: 같은 와이파이(같은 IP)의 관객들이 요청 제한을 나눠 쓰지 않도록 기기별 ID 전송
+    const headers = { "X-Client-Id": CLIENT_ID };
+    if (cfg.key) headers["X-API-Key"] = cfg.key;
+    const res = await fetch(url, { method: "POST", headers, body: formData, signal: ac.signal, cache: "no-store" });
+    const text = await res.text();
+    let body = null;
+    try { body = text ? JSON.parse(text) : null; } catch (_) { body = null; }
+    return { res, body, text };
+  } catch (err) {
+    if (timedOut) throw new Error(`시간 초과 (${timeoutMs / 1000}초)`);
+    throw new Error(`네트워크 오류: ${errorText(err)} (서버 주소, 서버 CORS 설정, 인터넷 연결 확인)`);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function requestDetect(video) {
+  const session = sessionId;
+  const version = cfgVersion;
+  const startedAt = performance.now();
+  srv.inFlight = true;
+  try {
+    const shot = await captureFrame(video, cfg.imgSize);
+    // 캡처·인코딩·전송 크기는 요청이 실패해도 매번 갱신
+    srv.lastCaptureMs = shot.captureMs;
+    srv.lastEncodeMs = shot.encodeMs;
+    srv.lastBytes = shot.blob.size;
+    const fd = new FormData();
+    fd.append("image", shot.blob, "frame.jpg");
+    fd.append("targets", cfg.targets.join(","));
+    fd.append("conf", String(SERVER_CONF));
+    fd.append("imgsz", String(cfg.imgSize));
+
+    const t0 = performance.now();
+    const { res, body, text } = await postForm(`${cfg.server}/detect`, fd, REQUEST_TIMEOUT_MS);
+    const rtt = performance.now() - t0;
+    if (session !== sessionId || version !== cfgVersion) return; // 이전 세션·설정의 응답은 버림
+
+    if (res.status === 429) {
+      // 요청 제한: 실패로 세지 않고 간격만 늘림
+      srv.rateLimited = true;
+      setStatus("서버 요청 제한(429): 2초 간격으로 늦춥니다", "warn", "server");
+      return;
+    }
+    if (res.status === 503) {
+      // 서버 과부하: 이번 주기는 로컬 인식 결과 사용 + 실패 1회
+      srv.localOnce = true;
+      registerFailure("서버 과부하(503), 이번에는 로컬 인식 사용");
+      return;
+    }
+    if (!res.ok) {
+      registerFailure(`HTTP ${res.status} ${text.slice(0, 200)}`);
+      return;
+    }
+    if (!body || !Array.isArray(body.detections)) {
+      registerFailure(`응답 형식 오류: ${text.slice(0, 200)}`);
+      return;
+    }
+    srv.lastTotalMs = shot.captureMs + shot.encodeMs + rtt;
+    handleDetectSuccess(body, rtt, shot.capturedAt);
+  } catch (err) {
+    if (session !== sessionId) return;
+    registerFailure(err.message || errorText(err));
+  } finally {
+    if (session === sessionId) {
+      srv.inFlight = false;
+      srv.lastStartedAt = startedAt; // 다음 요청은 이 시각 + 현재 간격 (매 프레임 계산)
+      renderStats();
+    }
+  }
+}
+
+function handleDetectSuccess(body, rtt, capturedAt) {
+  // 시간 기록
+  const total = Number(body.timing_ms && body.timing_ms.total);
+  srv.lastRtt = rtt;
+  srv.lastServerMs = Number.isFinite(total) ? total : null;
+  srv.lastNetMs = srv.lastServerMs !== null ? Math.max(0, rtt - srv.lastServerMs) : null;
+  srv.timingDetail = formatTiming(body.timing_ms);
+  if (body.device) srv.device = String(body.device);
+  if (body.model) srv.model = String(body.model);
+
+  // 왕복이 3번 연속 1초를 넘으면 이미지 크기를 한 단계 낮춤
+  if (rtt > SLOW_RTT_MS) {
+    srv.slowCount++;
+    if (srv.slowCount >= SLOW_RTT_STREAK) {
+      srv.slowCount = 0;
+      stepDownImageSize();
+    }
+  } else {
+    srv.slowCount = 0;
+  }
+
+  srv.failCount = 0;
+  srv.rateLimited = false;
+  if (srv.mode !== "server") {
+    srv.mode = "server";
+    setStatus("서버 연결 복구: 서버 인식으로 돌아왔습니다", "info", "server");
+  } else if (els.status.dataset.tag === "server") {
+    setStatus("");
+  }
+
+  // 결과 (서버는 찾는 물체만 보내줌)
+  const dets = body.detections.map(parseServerDetection).filter(Boolean);
+  const best = pickBest(dets);
+  // 높은 신뢰도로 연속 잡히면 간격을 늘리고, 놓치면 다시 짧게
+  if (best && best.score >= HIGH_CONF) srv.hitStreak++;
+  else srv.hitStreak = 0;
+
+  lastResult = { target: best ? toTarget(best) : null, best, detections: dets, others: [], capturedAt, source: "server" };
+  fps.object.count++;
+  onObjectResult();
+}
+
+function registerFailure(msg) {
+  srv.failCount++;
+  srv.hitStreak = 0;
+  if (srv.mode === "server" && srv.failCount >= FAIL_LIMIT) {
+    enterLocalMode(msg);
+    return;
+  }
+  if (srv.mode === "local") {
+    showLocalModeStatus(`서버 재연결 실패: ${msg}`);
+  } else {
+    setStatus(`서버 요청 실패 ${srv.failCount}/${FAIL_LIMIT}: ${msg}`, "warn", "server");
+  }
+}
+
+function enterLocalMode(msg) {
+  srv.mode = "local";
+  srv.rateLimited = false;
+  lastLocalRunAt = -Infinity;
+  // 로컬 모델이 찾을 수 없는 물체면 결과를 비움
+  const localOk = localTargets().length > 0 && Boolean(models.object.task);
+  if (!localOk) {
+    lastResult = emptyResult("local");
+    lastResult.capturedAt = performance.now();
+    onObjectResult();
+  }
+  showLocalModeStatus(`서버 연결 끊김 (${FAIL_LIMIT}번 연속 실패): ${msg}`);
+  // 시각장애인 사용자에게도 음성으로 알림 (탐색 하나당 한 번)
+  const t = app.task;
+  if (t && detectionActive() && !t.serverNoticeSaid) {
+    t.serverNoticeSaid = true;
+    voice.speak(localOk
+      ? "서버 연결이 끊겨서 인식이 덜 정확할 수 있어요"
+      : `서버 연결이 끊겨서 지금은 ${eulReul(t.ko)} 찾을 수 없어요. 잠시 후 다시 시도할게요`, PRIORITY.INFO, { group: "server" });
+  }
+}
+
+function showLocalModeStatus(reason) {
+  const lt = localTargets();
+  let what;
+  if (!models.object.task) what = `로컬 물체 인식 모델이 없어 찾을 수 없습니다${objectModelError ? ` (${objectModelError})` : ""}`;
+  else if (lt.length) what = `로컬 인식으로 찾는 중: ${lt.join(", ")}`;
+  else what = `"${cfg.targets.join(", ")}"은(는) 로컬 모델(기본 80종)에 없어 찾을 수 없습니다`;
+  const retry = cfg.server ? "\n5초마다 서버 재연결을 시도합니다" : "";
+  setStatus(`${reason}\n${what}${retry}`, "warn", "server");
+}
+
+function stepDownImageSize() {
+  const idx = IMAGE_SIZES.indexOf(cfg.imgSize);
+  if (idx <= 0) return;
+  cfg.imgSize = IMAGE_SIZES[idx - 1];
+  els.sizeSelect.value = String(cfg.imgSize);
+  setStatus(`응답이 느려 전송 이미지를 ${cfg.imgSize}px로 줄였습니다`, "info", "server");
+}
+
+function formatTiming(t) {
+  if (!t || typeof t !== "object") return "";
+  return Object.entries(t)
+    .filter(([k]) => k !== "total")
+    .map(([k, v]) => `${k} ${typeof v === "number" ? Math.round(v * 10) / 10 : v}ms`)
+    .join(", ");
+}
+
+// =====================================================================
+// 로컬 물체 인식 (MediaPipe ObjectDetector, 대체용)
+// =====================================================================
+function localTargets() {
+  return cfg.targets.filter((t) => COCO_LABELS.has(t));
+}
+
+function runLocal(video, now, W, H) {
+  lastLocalRunAt = now;
+  const om = models.object;
+  if (!om.task || om.switching) return;
+  let res;
+  try {
+    res = om.task.detectForVideo(video, now);
+  } catch (err) {
+    handleRuntimeError("object", err);
+    return;
+  }
+  const all = parseLocalObjects(res, W, H);
+  const lt = localTargets();
+  const dets = all.filter((o) => lt.includes(o.label));
+  const others = all.filter((o) => !lt.includes(o.label));
+  const best = pickBest(dets);
+  lastResult = { target: best ? toTarget(best) : null, best, detections: dets, others, capturedAt: now, source: "local" };
+  fps.object.count++;
+  onObjectResult();
+}
+
+// =====================================================================
+// 결과 변환
+// =====================================================================
+function buildHand(lm) {
+  const p = (i) => ({ x: clamp01(lm[i].x), y: clamp01(lm[i].y) });
+  return {
+    indexTip: p(8),   // 손 위치 = 검지 끝
+    thumbTip: p(4),   // 잡기 판정용 엄지 끝
+    palmCenter: { x: clamp01((lm[0].x + lm[9].x) / 2), y: clamp01((lm[0].y + lm[9].y) / 2) },
+  };
+}
+
+function normBox(x, y, w, h) {
+  const x1 = clamp01(x);
+  const y1 = clamp01(y);
+  const x2 = clamp01(x + w);
+  const y2 = clamp01(y + h);
+  return { x: x1, y: y1, w: x2 - x1, h: y2 - y1 };
+}
+
+// 서버 박스는 이미 0~1 정규화, x·y는 왼쪽 위 꼭짓점
+function parseServerDetection(d) {
+  if (!d || !d.box) return null;
+  const score = Number(d.score);
+  const b = d.box;
+  if (![b.x, b.y, b.w, b.h].every((v) => Number.isFinite(Number(v)))) return null;
+  return {
+    label: String(d.label ?? ""),
+    score: Number.isFinite(score) ? score : 0,
+    box: normBox(Number(b.x), Number(b.y), Number(b.w), Number(b.h)),
+  };
+}
+
+// MediaPipe 박스는 픽셀 단위라 영상 크기로 나눔
+function parseLocalObjects(res, W, H) {
+  const list = [];
+  for (const d of res.detections || []) {
+    const c = d.categories && d.categories[0];
+    const b = d.boundingBox;
+    if (!c || !b) continue;
+    list.push({
+      label: (c.categoryName || c.displayName || "").toLowerCase(),
+      score: c.score,
+      box: normBox(b.originX / W, b.originY / H, b.width / W, b.height / H),
+    });
+  }
+  return list;
+}
+
+function pickBest(list) {
+  let best = null;
+  for (const o of list) if (!best || o.score > best.score) best = o;
+  return best;
+}
+
+function toTarget(d) {
+  const { x, y, w, h } = d.box;
+  return { label: d.label, score: d.score, box: { x, y, w, h }, center: { x: x + w / 2, y: y + h / 2 } };
+}
+
+// =====================================================================
+// FPS·통계 표시 (#dev)
+// =====================================================================
+function updateFps(now) {
+  const dt = now - fps.windowStart;
+  if (dt < 1000) return;
+  fps.hand.value = Math.round((fps.hand.count * 1000) / dt * 10) / 10;
+  fps.object.value = Math.round((fps.object.count * 1000) / dt * 10) / 10;
+  fps.hand.count = 0;
+  fps.object.count = 0;
+  fps.windowStart = now;
+  renderStats();
+}
+
+function renderStats() {
+  if (!devMode) return;
+  const ms = (v) => (v === null || v === undefined ? "–" : `${Math.round(v)}ms`);
+  if (!cfg.server) els.modeVal.textContent = "로컬";
+  else els.modeVal.textContent = srv.mode === "server" ? "서버" : "로컬(끊김)";
+  els.handFpsVal.textContent = running ? fps.hand.value.toFixed(1) : "–";
+  els.objFpsVal.textContent = running ? fps.object.value.toFixed(1) : "–";
+  // 10ms 미만은 소수 한 자리까지 (캡처·인코딩은 보통 몇 ms라서)
+  const fine = (v) => (v === null || v === undefined ? "–" : v < 10 ? `${v.toFixed(1)}ms` : `${Math.round(v)}ms`);
+  els.captureVal.textContent = fine(srv.lastCaptureMs);
+  els.encodeVal.textContent = fine(srv.lastEncodeMs);
+  els.encodeLabel.textContent = `인코딩 (${ENCODER_LABELS[encoder.mode]})`;
+  els.bytesVal.textContent = srv.lastBytes === null ? "–" : `${(srv.lastBytes / 1024).toFixed(1)}KB`;
+  els.sizeLabel.textContent = `전송 크기 (${cfg.imgSize}px)`;
+  els.rttVal.textContent = ms(srv.lastRtt);
+  els.totalVal.textContent = ms(srv.lastTotalMs);
+  els.serverMsVal.textContent = ms(srv.lastServerMs);
+  els.netVal.textContent = ms(srv.lastNetMs);
+  if (!detectionActive()) els.intervalVal.textContent = "멈춤";
+  else if (!cfg.server) els.intervalVal.textContent = `${LOCAL_INTERVAL_MS}ms`;
+  else if (srv.mode === "local") els.intervalVal.textContent = "재연결 5초";
+  else {
+    // 물체는 안정적인데 손 때문에 0.3초를 유지하는 중이면 표시
+    const handHold = srv.hitStreak >= HIGH_CONF_STREAK && !srv.rateLimited && isHandVisible();
+    els.intervalVal.textContent = `${currentInterval()}ms${handHold ? " (손)" : ""}`;
+  }
+  els.deviceVal.textContent = srv.device || "–";
+
+  const parts = [];
+  if (srv.timingDetail) parts.push(`서버 세부: ${srv.timingDetail}`);
+  if (srv.model) parts.push(`모델: ${srv.model}`);
+  const d = (m) => (m.task ? m.delegate : m.switching ? "전환 중" : "없음");
+  parts.push(`손 ${d(models.hand)} / 로컬 물체 ${d(models.object)}`);
+  els.timingDetail.textContent = parts.join(" | ");
+}
+
+// =====================================================================
+// 상태 머신
+//   시작 전 → 대기 → 탐색 → 발견 → 손 안내 → 완료 → 대기
+//   (음성 명령은 어느 단계에서든 받음)
+// =====================================================================
+const S = { BOOT: "boot", IDLE: "idle", SEARCH: "search", FOUND: "found", GUIDE: "guide", DONE: "done" };
+const STATE_LABEL = { boot: "시작 전", idle: "대기", search: "탐색", found: "발견", guide: "손 안내", done: "완료" };
+
+const app = {
+  state: S.BOOT,
+  enteredAt: 0,
+  task: null,   // 지금 찾는 물건과 그에 대한 정보 (아래 newTask)
+  taskSeq: 0,
+  st: {},       // 현재 단계에서만 쓰는 값 (단계가 바뀌면 비움)
+};
+
+// 현재 상태 공개 (예: window.appState.name === "search")
+Object.defineProperty(window, "appState", {
+  configurable: true,
+  get() {
+    return {
+      name: app.state,
+      label: STATE_LABEL[app.state],
+      since: app.enteredAt,
+      target: app.task ? { ko: app.task.ko, en: app.task.en } : null,
+    };
+  },
+});
+
+function setState(next, reason = "") {
+  const prev = app.state;
+  app.state = next;
+  app.enteredAt = performance.now();
+  app.st = {};
+  document.body.dataset.state = next;
+  const msg = `${STATE_LABEL[prev]} → ${STATE_LABEL[next]}${reason ? ` (${reason})` : ""}`;
+  console.log(`[상태] ${msg}`);
+  devLog(els.stateLog, msg);
+  renderStateLine();
+  renderStats();
+}
+
+function newTask(obj) {
+  return {
+    id: ++app.taskSeq,
+    ko: obj.ko,
+    targets: obj.targets,           // /detect에 보낼 영어 이름들
+    en: obj.targets.join(","),
+    startedAt: performance.now(),
+    hitStreak: 0,          // 발견 판정용 연속 인식 횟수
+    lastSeenAt: -Infinity, // 마지막으로 보인 시각
+    missingSince: null,    // 안 보이기 시작한 시각
+    lastBox: null,         // 마지막으로 보인 박스
+    lastCenter: null,      // 마지막으로 보인 박스 중심
+    describe: {            // /describe 결과
+      state: "idle",       // idle | inflight | done | failed | unavailable
+      tries: 0,
+      retryAt: 0,
+      safety: "", grasp: "", comment: "",
+      gpRel: null,         // grasp_point를 박스 기준 비율로 저장 (박스가 움직여도 따라감)
+      gpConfident: false,
+    },
+    graspPending: false,   // 손 안내 시작 때 grasp가 아직 없었음 → 오면 바로 말함
+    graspRequested: false, // 사용자가 "어떻게 잡아"를 물었는데 아직 없었음
+    commentPending: false, // 완료 때 comment가 아직 없었음 → 오면 바로 말함
+    reachedSaid: false,    // "거기예요. 잡으세요"를 말했는지
+    serverNoticeSaid: false,
+  };
+}
+
+// 물체 인식(서버 요청)을 하는 단계
+function detectionActive() {
+  return running && (app.state === S.SEARCH || app.state === S.FOUND || app.state === S.GUIDE);
+}
+
+// 인식 일시정지: 진행 중인 응답은 버리고 결과를 비움
+function pauseDetection() {
+  cfgVersion++;
+  lastResult = emptyResult(srv.mode);
+  srv.hitStreak = 0;
+  srv.localOnce = false;
+}
+
+// 물체 인식 결과가 새로 올 때마다 (서버·로컬 공통)
+function onObjectResult() {
+  const t = app.task;
+  if (!t || !detectionActive()) return;
+  const r = lastResult;
+  const at = r.capturedAt || performance.now();
+  if (r.target) {
+    t.lastSeenAt = at;
+    t.missingSince = null;
+    t.lastBox = r.target.box;
+    t.lastCenter = r.target.center;
+    t.hitStreak = r.target.score >= C.foundScoreMin ? t.hitStreak + 1 : 0;
+  } else {
+    t.hitStreak = 0;
+    if (t.missingSince === null) t.missingSince = at;
+  }
+}
+
+// 매 프레임
+function tickApp(now, hand) {
+  switch (app.state) {
+    case S.SEARCH: tickSearch(now); break;
+    case S.FOUND: tickFound(now, hand); break;
+    case S.GUIDE: tickGuide(now, hand); break;
+    case S.DONE: tickDone(now, hand); break;
+    default: break;
+  }
+}
+
+// ---------------------------------------------------------------------
+// 음성 명령 처리
+// ---------------------------------------------------------------------
+// 사용자 명령에 대한 대답: 위치·손 안내 수준으로 바로 말함
+// interrupt=false: 지금 말하는 것("잠시만요" 등)이 끝난 뒤에 말함
+function reply(text, interrupt = true) {
+  voice.speak(text, PRIORITY.GUIDE, { group: "reply", interrupt });
+}
+
+const UNKNOWN_OBJECT_MSG = "아직 모르는 물건이에요. 다른 이름으로 말씀해 주세요";
+
+function handleIntent(intent) {
+  parseSeq++; // 기다리던 /parse 결과는 버림 (새 명령 우선)
+  if (!running && intent.type !== "stop") {
+    reply("아직 준비 중이에요. 잠시 후 다시 말씀해 주세요");
+    return;
+  }
+  switch (intent.type) {
+    case "stop":
+      stopGuidance("그만 명령");
+      break;
+    case "find": {
+      let obj = intent.object;
+      if (intent.empty) {
+        if (!defaultTarget) { reply("무엇을 찾을지 함께 말씀해 주세요. 예를 들어, 컵 찾아줘"); return; }
+        obj = defaultTarget;
+      }
+      if (!obj) {
+        // 사전에 없는 물건 → 문장 전체를 서버에서 해석
+        setStatus(`사전에 없는 물건: ${intent.name} → 서버에서 해석`, "info", "voice");
+        parseWithServer(intent.text);
+        return;
+      }
+      startTask(obj);
+      break;
+    }
+    case "where":
+      speakWhere();
+      break;
+    case "grasp":
+      speakGrasp(true);
+      break;
+    default:
+      // 단어로 판별 실패 → 문장 전체를 서버에서 해석
+      parseWithServer(intent.text);
+  }
+}
+
+// ---------------------------------------------------------------------
+// 문장 해석 (POST /parse)
+// 응답: { intent, targets, object_ko } - targets는 쉼표로 이어서 /detect의 targets로 사용
+// ---------------------------------------------------------------------
+let parseSeq = 0; // 새 명령·그만이 들어오면 증가. 이전 해석 결과는 버림
+let parseField = PARSE_TEXT_FIELD; // 422 응답이 다른 필드 이름을 요구하면 그 이름으로 바꿔 기억
+
+// 422 응답에서 "필수 필드가 없음" 오류의 필드 이름을 찾음 (서버 필드 이름이 다를 때 자동 맞춤)
+function missingFieldFrom422(body) {
+  const detail = (body && body.error && body.error.detail) || (body && body.detail);
+  if (!Array.isArray(detail)) return "";
+  for (const d of detail) {
+    const field = String(d.field ?? (Array.isArray(d.loc) ? d.loc[d.loc.length - 1] : "") ?? "");
+    const reason = String(d.reason ?? d.msg ?? d.type ?? "");
+    if (field && field !== "body" && /required|missing/i.test(reason)) return field;
+  }
+  return "";
+}
+
+async function parseWithServer(text) {
+  const seq = ++parseSeq;
+  const sentence = String(text || "").trim();
+  const t0 = performance.now();
+  const log = (result) => {
+    const ms = Math.round(performance.now() - t0);
+    const line = `“${sentence}”  ${ms}ms\n→ ${result}`;
+    devLog(els.parseLog, line, 40);
+    console.log(`[/parse] ${line}`);
+  };
+
+  if (!sentence || !cfg.server) {
+    log(!sentence ? "보낼 문장 없음" : "서버 주소 없음");
+    reply(UNKNOWN_OBJECT_MSG);
+    return;
+  }
+  // 기다리는 동안 한 번
+  voice.speak("잠시만요", PRIORITY.GUIDE, { group: "wait", interrupt: true });
+
+  let parsed = null;
+  try {
+    // 서버는 JSON 본문을 받음 (form으로 보내면 422)
+    let { res, body, text: raw } = await postJson(`${cfg.server}/parse`, { [parseField]: sentence }, PARSE_TIMEOUT_MS);
+    // 필드 이름이 다르면 422에 적힌 이름으로 한 번 더 (남은 시간 안에서)
+    const other = res.status === 422 ? missingFieldFrom422(body) : "";
+    const left = PARSE_TIMEOUT_MS - (performance.now() - t0);
+    if (other && other !== parseField && left > 300) {
+      log(`HTTP 422: 필드 "${parseField}" 대신 "${other}"로 다시 보냄`);
+      parseField = other;
+      ({ res, body, text: raw } = await postJson(`${cfg.server}/parse`, { [parseField]: sentence }, left));
+    }
+    if (!res.ok) throw new Error(`HTTP ${res.status} ${raw.slice(0, 300)}`);
+    if (!body || typeof body !== "object") throw new Error(`응답이 JSON이 아닙니다: ${raw.slice(0, 200)}`);
+    parsed = body;
+    log(JSON.stringify(body));
+  } catch (err) {
+    log(`실패: ${errorText(err)}`);
+  }
+  if (seq !== parseSeq) return; // 그사이 새 명령이 들어옴
+
+  if (!parsed) {
+    setStatus("문장 해석 실패", "warn", "voice");
+    reply(UNKNOWN_OBJECT_MSG, false);
+    return;
+  }
+  applyParseResult(parsed, sentence);
+}
+
+// intent 값 정리 (영어·한국어 표기 모두 허용)
+function normalizeParseIntent(v) {
+  const s = String(v ?? "").trim().toLowerCase();
+  if (!s) return "";
+  if (/^(stop|cancel|halt)|그만|멈|정지/.test(s)) return "stop";
+  if (/where|locat|position|위치|어디/.test(s)) return "where";
+  if (/grasp|hold|grip|handle|잡/.test(s)) return "grasp";
+  if (/find|search|look|찾/.test(s)) return "find";
+  return "other";
+}
+
+// targets: "cup,mug" 또는 ["cup", "mug"] → ["cup", "mug"]
+function normalizeTargets(v) {
+  const list = Array.isArray(v) ? v : typeof v === "string" ? v.split(",") : [];
+  return [...new Set(list.map((x) => String(x ?? "").trim().toLowerCase()).filter(Boolean))];
+}
+
+function applyParseResult(body, sentence) {
+  const intent = normalizeParseIntent(body.intent);
+  const targets = normalizeTargets(body.targets);
+  if (intent === "stop") { stopGuidance("/parse: 그만"); return; }
+  if (intent === "where") { speakWhere(); return; }
+  if (intent === "grasp") { speakGrasp(true); return; }
+  // 찾기 (intent가 비어 있어도 targets가 있으면 찾기로 봄)
+  if (!targets.length) {
+    setStatus(`해석 결과에 찾을 물체가 없음: “${sentence}”`, "warn", "voice");
+    reply(UNKNOWN_OBJECT_MSG, false);
+    return;
+  }
+  const ko = toSpeech(body.object_ko) || koNameOf(targets[0]) || "말씀하신 물건";
+  startTask({ ko, targets }, `${ko} 찾아볼게요. 폰을 천천히 돌려주세요`);
+}
+
+// "그만" 버튼·명령: 모든 안내 중지, 대기로
+function stopGuidance(reason) {
+  parseSeq++; // 기다리던 /parse 결과는 버림
+  voice.stopAll();
+  app.task = null;
+  pauseDetection();
+  setState(S.IDLE, reason);
+  voice.speak("안내를 멈췄어요", PRIORITY.INFO, { group: "reply" });
+}
+
+// 새 탐색 시작. obj: { ko, en } (사전) 또는 { ko, targets } (/parse)
+// message: /parse 결과로 시작하면 "○○ 찾아볼게요" ("잠시만요"를 끊지 않고 이어서 말함)
+function startTask(obj, message = "") {
+  parseSeq++; // 기다리던 /parse 결과는 버림
+  const targets = obj.targets && obj.targets.length ? obj.targets : [obj.en];
+  voice.clearGroups(["align", "correction", "lost", "hand", "grasp", "search", "found", "server"]);
+  app.task = newTask({ ko: obj.ko, targets });
+  cfg.targets = targets;        // 서버에는 영어 이름으로 요청 (여러 개면 쉼표로 이어짐)
+  cfgVersion++;
+  resetObjectState();
+  enterSearch(`새 탐색: ${obj.ko} → ${targets.join(",")}`);
+  if (message) reply(message, false);
+  else reply(`${eulReul(obj.ko)} 찾을게요. 폰을 천천히 돌려주세요`);
+}
+
+// "어디": 현재 방향·거리 다시 안내
+function speakWhere() {
+  const t = app.task;
+  if (!t || app.state === S.IDLE || app.state === S.BOOT) {
+    reply("지금 찾는 물건이 없어요. 말하기 버튼을 누르고 찾을 물건을 말씀해 주세요");
+    return;
+  }
+  if (app.state === S.DONE) { reply(`${eulReul(t.ko)} 잡았어요`); return; }
+  if (app.state === S.SEARCH) { reply(`아직 ${eulReul(t.ko)} 찾는 중이에요. 폰을 천천히 돌려주세요`); return; }
+  const tg = lastResult.target;
+  if (!tg) {
+    if (app.state === S.GUIDE && app.st.occluded) { reply("손 바로 앞에 있어요"); return; }
+    const side = t.lastCenter && t.lastCenter.x < 0.5 ? "왼쪽" : "오른쪽";
+    reply(`지금은 화면에 보이지 않아요. 마지막으로 ${side}에서 보였어요`);
+    return;
+  }
+  let text = `${horizontalPhrase(tg.center.x)} ${distancePhrase(tg.box.w)}`;
+  if (app.state === S.GUIDE && app.st.guide) {
+    if (app.st.guide.inside) text += ". 손 바로 앞이에요";
+    else if (app.st.guide.dir) text += `. 손은 ${app.st.guide.dir} 옮기세요`;
+  }
+  reply(text);
+}
+
+// "어떻게 잡아", "손잡이": grasp 문장 다시 말하기
+// fromUser: 사용자가 물어본 경우 (정보가 없으면 이유를 말함)
+function speakGrasp(fromUser) {
+  const t = app.task;
+  if (!t) {
+    if (fromUser) reply("지금 찾는 물건이 없어요. 찾을 물건을 먼저 말씀해 주세요");
+    return;
+  }
+  const d = t.describe;
+  if (d.grasp) {
+    t.graspPending = false;
+    t.graspRequested = false;
+    voice.speak(d.grasp, PRIORITY.GUIDE, { group: "grasp", keep: true, interrupt: fromUser });
+    return;
+  }
+  if (!fromUser) { t.graspPending = true; return; }
+  if (d.state === "inflight") {
+    t.graspRequested = true;
+    reply("잡는 방법을 알아보는 중이에요. 알게 되면 바로 말씀드릴게요");
+  } else if (d.state === "idle" && lastResult.target && detectionActive()) {
+    t.graspRequested = true;
+    requestDescribe();
+    reply("잡는 방법을 알아보는 중이에요. 알게 되면 바로 말씀드릴게요");
+  } else if (d.state === "idle") {
+    reply("물건이 화면에 보이면 잡는 방법을 알려 드릴게요");
+  } else {
+    reply("잡는 방법 정보를 받지 못했어요");
+  }
+}
+
+// ---------------------------------------------------------------------
+// 안내 문장 도우미
+// ---------------------------------------------------------------------
+function horizontalPhrase(cx) {
+  const off = cx - 0.5;
+  if (Math.abs(off) <= C.centerTolerance) return "정면에 있어요.";
+  return off < 0 ? "왼쪽에 있어요." : "오른쪽에 있어요.";
+}
+
+// 거리 구간 (정확한 미터는 말하지 않음)
+function distancePhrase(boxW) {
+  if (boxW >= C.distNearRatio) return "팔 닿는 거리예요";
+  if (boxW >= C.distMidRatio) return "한두 걸음 앞이에요";
+  return "조금 멀리 있어요";
+}
+
+// 같은 방향이 일정 시간 유지될 때만, 최소 간격·반복 제한을 지켜서 말함
+function makeCorrector() {
+  return {
+    cand: null, candSince: 0,
+    lastAt: -Infinity, lastText: "", lastTextAt: -Infinity,
+    reset() { this.cand = null; },
+    mark(now) { this.lastAt = now; }, // 다른 안내를 말한 것도 간격에 포함
+    update(dir, now, say) {
+      if (dir !== this.cand) { this.cand = dir; this.candSince = now; }
+      if (!dir) return;
+      if (now - this.candSince < C.correctionStableMs) return;   // 경계에서 왔다 갔다 방지
+      if (now - this.lastAt < C.correctionGapMs) return;         // 음성 교정 사이 최소 간격
+      if (dir === this.lastText && now - this.lastTextAt < C.sameRepeatMs) return; // 같은 말 반복 제한
+      this.lastAt = now;
+      this.lastText = dir;
+      this.lastTextAt = now;
+      say(dir);
+    },
+  };
+}
+
+// 지수 이동 평균 (떨림 줄이기)
+function ema(prev, cur, a) {
+  if (!prev) return { x: cur.x, y: cur.y };
+  return { x: prev.x + a * (cur.x - prev.x), y: prev.y + a * (cur.y - prev.y) };
+}
+
+function inBox(p, box, pad) {
+  const px = box.w * pad;
+  const py = box.h * pad;
+  return p.x >= box.x - px && p.x <= box.x + box.w + px && p.y >= box.y - py && p.y <= box.y + box.h + py;
+}
+
+// 비프 간격: r이 0.4 이상이면 800ms, 0.05 이하면 100ms, 그 사이는 비례
+function beepInterval(r) {
+  if (r >= C.beepFarDist) return C.beepFarMs;
+  if (r <= C.beepNearDist) return C.beepNearMs;
+  const k = (r - C.beepNearDist) / (C.beepFarDist - C.beepNearDist);
+  return Math.round(C.beepNearMs + k * (C.beepFarMs - C.beepNearMs));
+}
+
+// 목표 지점: grasp_point가 있고 confidence가 high면 그 점, 아니면 박스 중심
+function targetPoint(box, t) {
+  const d = t.describe;
+  if (d.gpRel && d.gpConfident) return { x: box.x + d.gpRel.u * box.w, y: box.y + d.gpRel.v * box.h };
+  return { x: box.x + box.w / 2, y: box.y + box.h / 2 };
+}
+
+function missingMs(now) {
+  const t = app.task;
+  return t && t.missingSince !== null ? now - t.missingSince : 0;
+}
+
+// 발견·손 안내 중 물체를 놓쳤을 때. 탐색으로 돌아가면 true
+function checkLost(now, occluded) {
+  const t = app.task;
+  const st = app.st;
+  if (lastResult.target) { st.lostSaidAt = -Infinity; return false; }
+  // 손에 가려진 경우는 놓친 것으로 세지 않음
+  if (occluded) { if (t.missingSince !== null) t.missingSince = now; return false; }
+  const miss = missingMs(now);
+  if (miss >= C.lostResearchMs) {
+    enterSearch("10초 이상 안 보임", true);
+    return true;
+  }
+  if (miss >= C.lostTurnMs && now - (st.lostSaidAt ?? -Infinity) >= C.lostTurnRepeatMs) {
+    st.lostSaidAt = now;
+    // 마지막으로 보인 쪽으로 폰을 돌리게 안내
+    const side = t.lastCenter && t.lastCenter.x < 0.5 ? "왼쪽" : "오른쪽";
+    voice.speak(`폰을 천천히 ${side}으로 돌려주세요`, PRIORITY.GUIDE, { group: "lost" });
+    if (st.corrector) st.corrector.mark(now);
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------------
+// 2. 탐색
+// ---------------------------------------------------------------------
+function enterSearch(reason, lost = false) {
+  setState(S.SEARCH, reason);
+  const now = performance.now();
+  app.st = { since: now, lastTickAt: now, hintSaid: false };
+  const t = app.task;
+  t.hitStreak = 0;
+  t.missingSince = null;
+  if (lost) {
+    voice.clearGroups(["align", "correction", "lost", "hand", "found"]);
+    voice.speak("물건을 놓쳤어요. 폰을 천천히 돌려주세요", PRIORITY.GUIDE, { group: "search", interrupt: true });
+  }
+}
+
+function tickSearch(now) {
+  const st = app.st;
+  const t = app.task;
+  const elapsed = now - st.since;
+
+  // 찾는 동안은 조용히: 5초마다 짧은 효과음, 5초에 한 번 안내, 30초면 포기
+  if (elapsed >= C.searchTimeoutMs) {
+    voice.speak("주변에서 찾지 못했어요", PRIORITY.GUIDE, { group: "search", interrupt: true });
+    app.task = null;
+    pauseDetection();
+    setState(S.IDLE, `${Math.round(C.searchTimeoutMs / 1000)}초 동안 못 찾음`);
+    return;
+  }
+  if (!st.hintSaid && elapsed >= C.searchHintMs) {
+    st.hintSaid = true;
+    st.lastTickAt = now;
+    voice.speak("아직 못 찾았어요. 계속 천천히 돌려주세요", PRIORITY.GUIDE, { group: "search" });
+  } else if (now - st.lastTickAt >= C.searchTickMs) {
+    st.lastTickAt = now;
+    if (!voice.isListening()) sound.searching();
+  }
+
+  // 발견 판정: 신뢰도가 높으면 한 번, 아니면 연속으로 잡혀야 함
+  const tg = lastResult.target;
+  if (tg && (tg.score >= C.foundScoreOnce || t.hitStreak >= C.foundStreak)) enterFound(now);
+}
+
+// ---------------------------------------------------------------------
+// 3. 발견: 화면 가운데로 맞추기
+// ---------------------------------------------------------------------
+function enterFound(now) {
+  setState(S.FOUND, `${pct(lastResult.target.score)}로 인식`);
+  const st = app.st;
+  st.corrector = makeCorrector();
+  st.corrector.mark(now);
+  st.centered = false;
+  st.centerSince = null;
+  st.handSince = null;
+  st.lostSaidAt = -Infinity;
+  vibrate(200);
+  voice.clearGroups(["search", "lost"]);
+  voice.speak("멈추세요", PRIORITY.GUIDE, { group: "found", interrupt: true });
+}
+
+function tickFound(now, hand) {
+  const st = app.st;
+  // 손이 화면에 들어오면 손 안내 단계로
+  if (hand) {
+    if (st.handSince === null) st.handSince = now;
+    if (now - st.handSince >= C.handEnterMs) { enterGuide(now); return; }
+  } else {
+    st.handSince = null;
+  }
+
+  if (checkLost(now, false)) return;
+  const tg = lastResult.target;
+  if (!tg) return;
+
+  if (st.centered) maybeRetryDescribe(now); // 정면을 맞춘 뒤 아직 설명 요청을 못 했으면 다시 시도
+  const off = tg.center.x - 0.5;
+  if (!st.centered) {
+    if (Math.abs(off) <= C.centerTolerance) {
+      st.corrector.update(null, now, () => {});
+      if (st.centerSince === null) st.centerSince = now;
+      if (now - st.centerSince >= C.centerHoldMs) {
+        st.centered = true;
+        voice.clearGroups(["align"]);
+        const near = tg.box.w >= C.distNearRatio;
+        voice.speak(`정면에 있어요. ${distancePhrase(tg.box.w)}${near ? ". 손을 천천히 뻗어 보세요" : ""}`, PRIORITY.GUIDE, { group: "align" });
+        st.corrector.mark(now);
+        // 가운데에 온 순간 /describe를 백그라운드로 한 번 호출
+        requestDescribe();
+      }
+    } else {
+      st.centerSince = null;
+      // 물체가 왼쪽에 있으면 폰을 왼쪽으로
+      const dir = off < 0 ? "조금 왼쪽으로" : "조금 오른쪽으로";
+      st.corrector.update(dir, now, (text) => voice.speak(text, PRIORITY.GUIDE, { group: "align", ttl: C.correctionTtlMs }));
+    }
+  } else if (Math.abs(off) > C.centerRelease) {
+    // 가운데에서 많이 벗어나면 다시 좌우 안내
+    st.centered = false;
+    st.centerSince = null;
+  }
+}
+
+// ---------------------------------------------------------------------
+// 4. 손 안내
+// ---------------------------------------------------------------------
+function enterGuide(now) {
+  setState(S.GUIDE, "손이 화면에 들어옴");
+  const st = app.st;
+  st.corrector = makeCorrector();
+  st.corrector.mark(now);
+  st.hand = null;            // 검지 끝 (지수 이동 평균)
+  st.target = null;          // 목표 지점 (지수 이동 평균)
+  st.box = app.task.lastBox; // 목표 범위·잡기 판정에 쓰는 박스 (가려지면 마지막 박스 유지)
+  st.handSeenAt = now;
+  st.handLostSaid = false;
+  st.inTarget = false;
+  st.lastBeepAt = -Infinity;
+  st.graspSince = null;
+  st.lostSaidAt = -Infinity;
+  st.occluded = false;
+  st.guide = null;
+  voice.clearGroups(["align", "found"]);
+  if (app.task.describe.state === "idle") requestDescribe();
+  // 시작할 때 grasp 문장 한 번 (아직 응답 전이면 응답이 오는 대로)
+  speakGrasp(false);
+}
+
+function tickGuide(now, hand) {
+  const t = app.task;
+  const st = app.st;
+
+  // ---- 손 위치: 검지 끝 ----
+  if (hand) {
+    if (!st.hand) st.corrector.reset();
+    st.handSeenAt = now;
+    st.handLostSaid = false;
+    st.hand = ema(st.hand, hand.indexTip, C.emaAlpha);
+  } else if (st.hand && now - st.handSeenAt >= C.handLostMs) {
+    // 손을 1초 이상 놓침: 비프 멈추고 알림
+    st.hand = null;
+    st.inTarget = false;
+    st.graspSince = null;
+    if (!st.handLostSaid) {
+      st.handLostSaid = true;
+      voice.clearGroups(["correction"]);
+      voice.speak("손이 화면에서 벗어났어요", PRIORITY.GUIDE, { group: "hand" });
+      st.corrector.mark(now);
+    }
+  }
+
+  // ---- 목표 지점 ----
+  const tg = lastResult.target;
+  if (tg) {
+    st.box = tg.box;
+    st.target = ema(st.target, targetPoint(tg.box, t), C.emaAlpha);
+  } else if (!st.target && st.box) {
+    st.target = targetPoint(st.box, t);
+  }
+  // 손이 목표에 가까운데 물체가 안 보이면 손에 가려진 것: 마지막 목표 위치 유지
+  st.occluded = !tg && Boolean(st.hand && st.target) && Math.hypot(st.target.x - st.hand.x, st.target.y - st.hand.y) <= C.occludeDist;
+  if (checkLost(now, st.occluded)) return;
+  const lost = !tg && !st.occluded && missingMs(now) >= C.lostTurnMs;
+
+  if (!st.hand || !st.target || lost || voice.isListening()) {
+    st.guide = null;
+    return; // 비프 없음
+  }
+
+  // ---- 차이 벡터 ----
+  const dx = st.target.x - st.hand.x;
+  const dy = st.target.y - st.hand.y;
+  const r = Math.hypot(dx, dy);
+  const tip = hand ? hand.indexTip : st.hand;
+  const tipInBox = Boolean(st.box) && inBox(tip, st.box, 0);
+  const inside = tipInBox || r <= (st.inTarget ? C.targetExitRadius : C.targetRadius);
+
+  // 목표 범위에 들어옴: 높은 음 한 번 + 진동, 처음이면 "거기예요. 잡으세요"
+  if (inside && !st.inTarget) {
+    sound.hit();
+    vibrate(80);
+    if (!t.reachedSaid) {
+      t.reachedSaid = true;
+      voice.clearGroups(["correction"]);
+      voice.speak("거기예요. 잡으세요", PRIORITY.GUIDE, { group: "correction" });
+      st.corrector.mark(now);
+    }
+  }
+  st.inTarget = inside;
+
+  // ---- 비프음: 가까울수록 빠르게, 옮겨야 할 쪽에서 소리 ----
+  const interval = beepInterval(r);
+  const pan = clamp(dx / C.panRange, -1, 1);
+  if (!inside && now - st.lastBeepAt >= interval) {
+    sound.beep(pan);
+    st.lastBeepAt = now;
+  }
+
+  // ---- 음성 교정: |dx|, |dy| 중 큰 쪽 ----
+  let dir = null;
+  if (!inside) {
+    const ax = Math.abs(dx);
+    const ay = Math.abs(dy);
+    if (Math.max(ax, ay) > C.correctionMin) {
+      if (ax >= ay) dir = dx > 0 ? "오른쪽으로" : "왼쪽으로";
+      else dir = dy < 0 ? "앞으로" : "몸 쪽으로";
+    }
+  }
+  st.corrector.update(dir, now, (text) => voice.speak(text, PRIORITY.GUIDE, { group: "correction", ttl: C.correctionTtlMs }));
+  st.guide = { dx, dy, r, dir, inside, interval: inside ? 0 : interval, pan };
+
+  // ---- 잡기 성공: 엄지 끝·검지 끝이 모두 (사방 10% 넓힌) 박스 안에 1초 이상 ----
+  if (hand && st.box) {
+    const ok = inBox(hand.indexTip, st.box, C.graspBoxPad) && inBox(hand.thumbTip, st.box, C.graspBoxPad);
+    if (ok) {
+      if (st.graspSince === null) st.graspSince = now;
+      if (now - st.graspSince >= C.graspHoldMs) { enterDone(); return; }
+    } else {
+      st.graspSince = null;
+    }
+  }
+
+  maybeRetryDescribe(now);
+}
+
+// ---------------------------------------------------------------------
+// 5. 완료
+// ---------------------------------------------------------------------
+function enterDone() {
+  setState(S.DONE, "잡기 성공");
+  app.st = { handGoneSince: null };
+  pauseDetection(); // 손이 화면에서 사라질 때까지 인식 일시정지
+  voice.clearGroups(["align", "correction", "lost", "hand", "grasp", "found", "search"]);
+  sound.success();
+  vibrate([80, 60, 80]);
+  voice.speak("잡았어요", PRIORITY.GUIDE, { interrupt: true });
+  const t = app.task;
+  if (t.describe.comment) voice.speak(t.describe.comment, PRIORITY.INFO, { group: "comment" });
+  else if (t.describe.state === "inflight" || t.describe.state === "idle") t.commentPending = true;
+}
+
+function tickDone(now, hand) {
+  const st = app.st;
+  if (hand) { st.handGoneSince = null; return; }
+  if (st.handGoneSince === null) st.handGoneSince = now;
+  if (now - st.handGoneSince >= C.doneHandGoneMs) setState(S.IDLE, "손이 화면에서 사라짐");
+}
+
+// =====================================================================
+// VLM 설명 요청 (POST /describe) - 발견 후 백그라운드로 한 번
+// =====================================================================
+function maybeRetryDescribe(now) {
+  const d = app.task && app.task.describe;
+  if (d && d.state === "idle" && d.tries < DESCRIBE_MAX_TRIES && now >= d.retryAt) requestDescribe();
+}
+
+async function requestDescribe() {
+  const t = app.task;
+  if (!t || t.describe.state !== "idle") return;
+  const d = t.describe;
+  if (!cfg.server) { d.state = "unavailable"; return; }
+  const tg = lastResult.target;
+  if (!tg) return; // 물체가 보일 때 다시 시도
+
+  // 박스를 사방 20% 넓혀서 자르기
+  const video = els.video;
+  const vw = video.videoWidth;
+  const vh = video.videoHeight;
+  const b = tg.box;
+  const x0 = clamp01(b.x - b.w * DESCRIBE_PAD);
+  const y0 = clamp01(b.y - b.h * DESCRIBE_PAD);
+  const x1 = clamp01(b.x + b.w * (1 + DESCRIBE_PAD));
+  const y1 = clamp01(b.y + b.h * (1 + DESCRIBE_PAD));
+  const sw = (x1 - x0) * vw;
+  const sh = (y1 - y0) * vh;
+  if (!vw || sw < 4 || sh < 4) return;
+  const scale = Math.min(1, DESCRIBE_MAX_SIDE / Math.max(sw, sh));
+  const cw = Math.max(1, Math.round(sw * scale));
+  const ch = Math.max(1, Math.round(sh * scale));
+  const crop = { x0, y0, x1, y1, w: cw, h: ch };
+  const boxAtCapture = { ...b };
+
+  d.state = "inflight";
+  d.tries++;
+  const t0 = performance.now();
+  try {
+    const { blob } = await encodeJpeg(
+      cw, ch,
+      (c) => c.drawImage(video, x0 * vw, y0 * vh, sw, sh, 0, 0, cw, ch),
+      DESCRIBE_JPEG_QUALITY
+    );
+    const fd = new FormData();
+    fd.append("image", blob, "crop.jpg");
+    const { res, body, text } = await postForm(`${cfg.server}/describe`, fd, DESCRIBE_TIMEOUT_MS);
+    const elapsed = Math.round(performance.now() - t0);
+    if (res.status === 429 || res.status === 503) {
+      // 요청 제한·과부하: 잠시 뒤 한 번 더
+      d.state = d.tries < DESCRIBE_MAX_TRIES ? "idle" : "failed";
+      d.retryAt = performance.now() + DESCRIBE_RETRY_MS;
+      throw new Error(`HTTP ${res.status} (${elapsed}ms)`);
+    }
+    if (!res.ok) throw new Error(`HTTP ${res.status} (${elapsed}ms) ${text.slice(0, 300)}`);
+    if (!body) throw new Error(`응답이 JSON이 아닙니다 (${elapsed}ms): ${text.slice(0, 300)}`);
+    els.describeOut.textContent = `응답 시간: ${elapsed}ms\n대상: ${t.ko} (${tg.label} ${pct(tg.score)})\n\n${JSON.stringify(body, null, 2)}`;
+    if (app.task !== t) return; // 그사이 새 탐색이 시작됐으면 버림
+    applyDescribe(t, body, crop, boxAtCapture);
+    devLog(els.stateLog, `설명 응답 (${elapsed}ms) safety=${t.describe.safety ? "있음" : "없음"}, grasp_point=${t.describe.gpRel ? (t.describe.gpConfident ? "사용" : "신뢰 낮음") : "없음"}`);
+  } catch (err) {
+    if (d.state === "inflight") d.state = "failed";
+    els.describeOut.textContent = `실패: ${errorText(err)}`;
+    console.warn("설명 요청 실패", err);
+    setStatus(`설명 요청 실패: ${errorText(err)}`, "warn", "describe");
+    if (app.task === t && d.state === "failed") {
+      if (t.graspRequested) { t.graspRequested = false; voice.speak("잡는 방법 정보를 받지 못했어요", PRIORITY.INFO); }
+      t.graspPending = false;
+      t.commentPending = false;
+    }
+  }
+}
+
+function applyDescribe(t, body, crop, box) {
+  const d = t.describe;
+  // 안전 경고 ("없음" 같은 빈 값은 무시)
+  const safety = toSpeech(body.safety);
+  d.safety = /^(없음|없어요|없습니다|해당\s*없음|none|null|n\/a|-)?\.?$/i.test(safety) ? "" : safety;
+  // 잡는 방법 문장
+  const g = body.grasp;
+  const grasp = g && typeof g === "object" && !Array.isArray(g) ? (g.text ?? g.description ?? g.sentence ?? "") : g;
+  d.grasp = toSpeech(grasp);
+  d.comment = toSpeech(body.comment);
+
+  // 잡을 위치: 박스 기준 비율로 저장 → 폰이 조금 움직여도 지금 박스에서 같은 자리를 가리킴
+  const gp = parseGraspPoint(body.grasp_point ?? (g && typeof g === "object" ? g.grasp_point : null), crop);
+  if (gp && box.w > 0 && box.h > 0) {
+    d.gpRel = {
+      u: clamp((gp.x - box.x) / box.w, -DESCRIBE_PAD, 1 + DESCRIBE_PAD),
+      v: clamp((gp.y - box.y) / box.h, -DESCRIBE_PAD, 1 + DESCRIBE_PAD),
+    };
+  }
+  d.gpConfident = Boolean(d.gpRel) && isHighConfidence(findConfidence(body));
+  d.state = "done";
+
+  // 안전 경고는 즉시 (최우선)
+  if (d.safety) voice.speak(d.safety, PRIORITY.SAFETY, { group: "safety" });
+  // 손 안내 중에 기다리던 grasp, 사용자가 물어본 grasp
+  if ((app.state === S.GUIDE && t.graspPending) || t.graspRequested) speakGrasp(false);
+  // 완료 후에 기다리던 comment
+  if (t.commentPending) {
+    t.commentPending = false;
+    if (d.comment) voice.speak(d.comment, PRIORITY.INFO, { group: "comment" });
+  }
+}
+
+// confidence가 어디에 오든 찾음 (grasp_point 안, grasp 안, 최상위)
+function findConfidence(body) {
+  const gp = body.grasp_point;
+  const g = body.grasp;
+  const cands = [
+    gp && typeof gp === "object" && !Array.isArray(gp) ? gp.confidence : undefined,
+    g && typeof g === "object" && !Array.isArray(g) ? g.confidence : undefined,
+    body.grasp_point_confidence,
+    body.grasp_confidence,
+    body.confidence,
+  ];
+  return cands.find((v) => v !== undefined && v !== null && v !== "");
+}
+
+function isHighConfidence(v) {
+  if (typeof v === "number") return v >= C.graspConfidenceNum;
+  if (typeof v === "string") {
+    const s = v.trim().toLowerCase();
+    if (s === C.graspConfidenceWord || s === "높음") return true;
+    const n = Number(s);
+    return Number.isFinite(n) && n >= C.graspConfidenceNum;
+  }
+  return false;
+}
+
+// grasp_point: {x,y} 또는 [x,y]. 0~1이면 잘라낸 이미지 기준 정규화 좌표,
+// 1보다 크면 잘라낸 이미지의 픽셀 좌표로 보고 전체 화면 좌표로 바꿈
+function parseGraspPoint(gp, crop) {
+  if (!gp) return null;
+  let x, y;
+  if (Array.isArray(gp)) [x, y] = gp;
+  else if (typeof gp === "object") ({ x, y } = gp);
+  x = Number(x);
+  y = Number(y);
+  if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+  if (x > 1 || y > 1) { x /= crop.w; y /= crop.h; }
+  return {
+    x: clamp01(crop.x0 + clamp01(x) * (crop.x1 - crop.x0)),
+    y: clamp01(crop.y0 + clamp01(y) * (crop.y1 - crop.y0)),
+  };
+}
+
+// =====================================================================
+// 화면 글자 (큰 상태 한 줄)
+// =====================================================================
+function renderStateLine(override) {
+  let text = override;
+  if (!text) {
+    const t = app.task;
+    const listen = document.body.dataset.listen;
+    if (listen && listen !== "off") {
+      text = listenText ? `“${listenText}”` : listen === "on" ? "듣는 중… 말씀하세요" : "잠시만요";
+    } else {
+      switch (app.state) {
+        case S.BOOT: text = "준비 중"; break;
+        case S.IDLE: text = "말하기를 누르고 물건 이름을 말하세요"; break;
+        case S.SEARCH: text = `${t ? t.ko : ""} 찾는 중`; break;
+        case S.FOUND: text = `${t ? t.ko : ""} 발견`; break;
+        case S.GUIDE: text = `${t ? t.ko : ""} 쪽으로 손 안내 중`; break;
+        case S.DONE: text = "잡았어요"; break;
+        default: text = "";
+      }
+    }
+  }
+  if (els.stateLine.textContent !== text) els.stateLine.textContent = text;
+}
+
+// =====================================================================
+// 그리기 (관객용: 박스·손·잡을 곳 / #dev: 손→목표 선, r, 방향, 비프 간격)
+// =====================================================================
+function draw(handLandmarks, now) {
+  const W = els.canvas.width;
+  const H = els.canvas.height;
+  ctx.clearRect(0, 0, W, H);
+  const s = W / Math.max(1, els.canvas.clientWidth); // 화면에서 선 두께를 일정하게
+
+  const r = lastResult;
+
+  // 찾는 물체가 아닌 것 (로컬 모드, "다른 물체 보기"일 때만 흐리게)
+  if (showOthers) {
+    for (const o of r.others) {
+      drawBox(o, W, H, s, { color: COLOR_OTHER, alpha: 0.35, width: 1.5, text: `${o.label} ${pct(o.score)}`, weight: 500 });
+    }
+  }
+
+  // 찾는 물체: 진하게. 신뢰도가 가장 높은 것은 더 두껍게
+  const suffix = r.source === "local" ? " (로컬)" : "";
+  const koName = app.task ? app.task.ko : "";
+  for (const d of r.detections) {
+    const isBest = d === r.best;
+    drawBox(d, W, H, s, { color: COLOR_TARGET, alpha: isBest ? 1 : 0.8, width: isBest ? 4 : 2.5, text: `${koName || d.label} ${pct(d.score)}${suffix}`, weight: 800 });
+  }
+  if (r.target) {
+    const cx = r.target.center.x * W;
+    const cy = r.target.center.y * H;
+    ctx.save();
+    ctx.strokeStyle = COLOR_TARGET;
+    ctx.lineWidth = 3 * s;
+    ctx.beginPath();
+    ctx.moveTo(cx - 12 * s, cy); ctx.lineTo(cx + 12 * s, cy);
+    ctx.moveTo(cx, cy - 12 * s); ctx.lineTo(cx, cy + 12 * s);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  // 서버 연결 끊김 표시
+  if (cfg.server && srv.mode === "local" && detectionActive()) drawTag("서버 연결 끊김", COLOR_DISCONNECT, W, s);
+
+  // 잡을 곳 (/describe의 grasp_point)
+  const t = app.task;
+  const box = r.target ? r.target.box : app.state === S.GUIDE ? app.st.box : null;
+  if (t && t.describe.gpRel && box && (app.state === S.FOUND || app.state === S.GUIDE)) {
+    const gx = (box.x + t.describe.gpRel.u * box.w) * W;
+    const gy = (box.y + t.describe.gpRel.v * box.h) * H;
+    drawGrasp(gx, gy, s, t.describe.gpConfident);
+  }
+
+  // 손 안내 목표 지점과 (#dev) 손→목표 선
+  const st = app.st;
+  if (app.state === S.GUIDE && st.target) {
+    const tx = st.target.x * W;
+    const ty = st.target.y * H;
+    ctx.save();
+    ctx.strokeStyle = COLOR_GUIDE;
+    ctx.lineWidth = 3 * s;
+    ctx.beginPath();
+    ctx.arc(tx, ty, (st.inTarget ? 22 : 14) * s, 0, Math.PI * 2);
+    ctx.stroke();
+    if (devMode && st.hand) {
+      ctx.setLineDash([10 * s, 8 * s]);
+      ctx.beginPath();
+      ctx.moveTo(st.hand.x * W, st.hand.y * H);
+      ctx.lineTo(tx, ty);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      if (st.guide) {
+        const g = st.guide;
+        const label = `r ${g.r.toFixed(3)}  ${g.inside ? "목표 안" : g.dir || "–"}  ${g.inside ? "비프 없음" : `${g.interval}ms`}`;
+        const mx = ((st.hand.x + st.target.x) / 2) * W;
+        const my = ((st.hand.y + st.target.y) / 2) * H;
+        drawLabel(label, mx, my, s);
+      }
+    }
+    ctx.restore();
+  }
+
+  if (handLandmarks) drawHand(handLandmarks, W, H, s);
+}
+
+function drawBox(o, W, H, s, style) {
+  const x = o.box.x * W;
+  const y = o.box.y * H;
+  const w = o.box.w * W;
+  const h = o.box.h * H;
+  ctx.save();
+  ctx.globalAlpha = style.alpha;
+  ctx.strokeStyle = style.color;
+  ctx.lineWidth = style.width * s;
+  ctx.strokeRect(x, y, w, h);
+
+  const fontPx = 16 * s;
+  ctx.font = `${style.weight} ${fontPx}px system-ui, sans-serif`;
+  const pad = 4 * s;
+  const tw = ctx.measureText(style.text).width;
+  const th = fontPx + pad * 2;
+  const ty = y - th >= 0 ? y - th : y;
+  ctx.fillStyle = style.color;
+  ctx.fillRect(x, ty, tw + pad * 2, th);
+  ctx.fillStyle = "#000000";
+  ctx.textBaseline = "top";
+  ctx.fillText(style.text, x + pad, ty + pad);
+  ctx.restore();
+}
+
+function drawTag(text, color, W, s) {
+  ctx.save();
+  const fontPx = 18 * s;
+  ctx.font = `800 ${fontPx}px system-ui, sans-serif`;
+  const pad = 8 * s;
+  const tw = ctx.measureText(text).width;
+  ctx.fillStyle = color;
+  ctx.fillRect(10 * s, 10 * s, tw + pad * 2, fontPx + pad * 2);
+  ctx.fillStyle = "#ffffff";
+  ctx.textBaseline = "top";
+  ctx.fillText(text, 10 * s + pad, 10 * s + pad);
+  ctx.restore();
+}
+
+function drawLabel(text, x, y, s) {
+  ctx.save();
+  const fontPx = 15 * s;
+  ctx.font = `700 ${fontPx}px system-ui, sans-serif`;
+  const pad = 5 * s;
+  const tw = ctx.measureText(text).width;
+  const bx = clamp(x - tw / 2 - pad, 0, Math.max(0, els.canvas.width - tw - pad * 2));
+  ctx.fillStyle = "rgba(0,0,0,0.78)";
+  ctx.fillRect(bx, y - fontPx / 2 - pad, tw + pad * 2, fontPx + pad * 2);
+  ctx.fillStyle = "#ffffff";
+  ctx.textBaseline = "middle";
+  ctx.fillText(text, bx + pad, y);
+  ctx.restore();
+}
+
+function drawGrasp(x, y, s, confident) {
+  ctx.save();
+  ctx.globalAlpha = confident ? 1 : 0.55;
+  ctx.fillStyle = COLOR_GRASP;
+  ctx.beginPath();
+  ctx.arc(x, y, 10 * s, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.strokeStyle = "#ffffff";
+  ctx.lineWidth = 3 * s;
+  ctx.beginPath();
+  ctx.arc(x, y, 16 * s, 0, Math.PI * 2);
+  ctx.stroke();
+  ctx.font = `800 ${15 * s}px system-ui, sans-serif`;
+  ctx.fillStyle = COLOR_GRASP;
+  ctx.textBaseline = "middle";
+  ctx.fillText(confident ? "잡을 곳" : "잡을 곳(낮은 확신)", x + 22 * s, y);
+  ctx.restore();
+}
+
+function drawHand(lm, W, H, s) {
+  ctx.save();
+  ctx.strokeStyle = COLOR_HAND_LINE;
+  ctx.lineWidth = 3 * s;
+  ctx.lineCap = "round";
+  ctx.beginPath();
+  for (const [a, b] of HAND_CONNECTIONS) {
+    ctx.moveTo(lm[a].x * W, lm[a].y * H);
+    ctx.lineTo(lm[b].x * W, lm[b].y * H);
+  }
+  ctx.stroke();
+
+  ctx.fillStyle = COLOR_HAND_POINT;
+  ctx.lineWidth = 1.5 * s;
+  for (let i = 0; i < lm.length; i++) {
+    if (i === 8) continue;
+    ctx.beginPath();
+    ctx.arc(lm[i].x * W, lm[i].y * H, 4 * s, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+  }
+
+  // 검지 끝 강조 (손 위치)
+  const ix = lm[8].x * W;
+  const iy = lm[8].y * H;
+  ctx.fillStyle = COLOR_INDEX_TIP;
+  ctx.beginPath();
+  ctx.arc(ix, iy, 11 * s, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.strokeStyle = "#ffffff";
+  ctx.lineWidth = 3 * s;
+  ctx.beginPath();
+  ctx.arc(ix, iy, 17 * s, 0, Math.PI * 2);
+  ctx.stroke();
+  ctx.restore();
+}
+
+// =====================================================================
+// #dev 화면 갱신
+// =====================================================================
+function updateDebug(detection, now) {
+  if (!devMode || now - lastDebugUpdate < 200) return;
+  lastDebugUpdate = now;
+  els.output.textContent = JSON.stringify(
+    detection,
+    (k, v) => (typeof v === "number" ? Math.round(v * 1000) / 1000 : v),
+    2
+  );
+  const t = app.task;
+  const st = app.st;
+  const lines = [
+    `상태: ${STATE_LABEL[app.state]} (${((now - app.enteredAt) / 1000).toFixed(1)}초)`,
+    `찾는 물건: ${t ? `${t.ko} → ${t.en}` : "없음"}${defaultTarget ? ` / 기본: ${defaultTarget.ko}` : ""}`,
+  ];
+  if (t) {
+    const d = t.describe;
+    lines.push(`설명: ${d.state}${d.gpRel ? `, grasp_point ${d.gpConfident ? "사용" : "신뢰 낮음(박스 중심 사용)"}` : ""}${d.safety ? ", safety 있음" : ""}`);
+    lines.push(`안 보인 시간: ${lastResult.target ? "보임" : `${(missingMs(now) / 1000).toFixed(1)}초`}`);
+  }
+  if (app.state === S.GUIDE) {
+    const g = st.guide;
+    lines.push(`손: ${st.hand ? `${st.hand.x.toFixed(2)}, ${st.hand.y.toFixed(2)}` : "없음"}  목표: ${st.target ? `${st.target.x.toFixed(2)}, ${st.target.y.toFixed(2)}` : "없음"}${st.occluded ? " (손에 가려짐)" : ""}`);
+    if (g) {
+      lines.push(`dx ${g.dx.toFixed(3)}  dy ${g.dy.toFixed(3)}  r ${g.r.toFixed(3)}`);
+      lines.push(`안내 방향: ${g.inside ? "목표 범위 안" : g.dir || "– (0.08 이하)"}`);
+      lines.push(`비프 간격: ${g.inside ? "없음" : `${g.interval}ms`}  pan ${g.pan.toFixed(2)}`);
+    } else {
+      lines.push("비프: 멈춤");
+    }
+    lines.push(`잡기 판정: ${st.graspSince !== null ? `${((now - st.graspSince) / 1000).toFixed(1)}초` : "–"}`);
+  }
+  lines.push(`음성: ${voice.isListening() ? "듣는 중" : voice.isSpeaking() ? "말하는 중" : "조용"} (대기열 ${voice.queueLength()})`);
+  els.guideInfo.textContent = lines.join("\n");
+}
+
+// =====================================================================
+// QR 코드 (#dev: 발표 화면에서 관객 접속용)
+// =====================================================================
+// QR 주소에는 key와 target만 넣음 (server·dev는 넣지 않음)
+// mask=true 이면 화면 표시용으로 키를 가림
+function buildShareUrl(mask = false) {
+  const base = location.href.split("#")[0];
+  const p = new URLSearchParams();
+  if (cfg.key) p.set("key", mask ? "KEY" : cfg.key);
+  const target = els.targetInput.value.trim();
+  if (target) p.set("target", target);
+  const url = `${base}#${p.toString()}`;
+  return mask ? url.replace("key=KEY", "key=••••") : url;
+}
+
+function showQr() {
+  readConfig();
+  if (typeof window.QRious !== "function") {
+    showError("QR 라이브러리를 불러오지 못했습니다. 인터넷 연결을 확인하고 새로고침하세요.");
+    return;
+  }
+  const url = buildShareUrl();
+
+  // 관객 폰에서 열 수 없는 주소면 경고
+  const warns = [];
+  if (location.protocol !== "https:" || /^(localhost|127\.0\.0\.1)$/.test(location.hostname)) {
+    warns.push("지금 페이지 주소는 관객 폰에서 열 수 없습니다. HTTPS로 배포한 주소에서 QR을 띄워 주세요.");
+  }
+  if (!cfg.key) warns.push("API 키가 비어 있습니다. 주소 # 뒤에 key 값을 넣어 주세요.");
+  // QR에는 서버 주소가 들어가지 않으므로, 관객은 이 페이지와 같은 주소의 서버를 씀
+  if (cfg.server && cfg.server !== location.origin) {
+    warns.push(`QR로 접속한 관객은 ${location.origin} 서버를 사용합니다. 지금 입력한 서버 주소(${cfg.server})와 다릅니다.`);
+  }
+  els.qrWarn.textContent = warns.join(" ");
+  els.qrWarn.hidden = warns.length === 0;
+
+  els.qrModal.hidden = false;
+  const cssSize = Math.floor(Math.min(window.innerWidth, window.innerHeight) * 0.75);
+  const dpr = Math.min(3, window.devicePixelRatio || 1);
+  new window.QRious({
+    element: els.qrCanvas,
+    value: url,
+    size: Math.round(cssSize * dpr),
+    level: "M",
+    background: "#ffffff",
+    foreground: "#000000",
+  });
+  els.qrCanvas.style.width = `${cssSize}px`;
+  els.qrCanvas.style.height = `${cssSize}px`;
+  // 화면에는 키를 가려서 표시
+  els.qrUrl.textContent = buildShareUrl(true);
+  els.qrCloseBtn.focus();
+}
+
+function hideQr() {
+  els.qrModal.hidden = true;
+  els.qrBtn.focus();
+}
+
+// =====================================================================
+// 버튼·입력 이벤트
+// =====================================================================
+els.startBtn.addEventListener("click", start);
+
+// 말하기: TalkBack은 두 번 탭, 일반 사용자는 한 번 탭 → 둘 다 click 하나로 들어옴
+els.talkBtn.addEventListener("click", () => {
+  sound.unlock();
+  voice.listen();
+});
+
+// 그만: 모든 안내 중지, 대기로
+els.stopBtn.addEventListener("click", () => {
+  sound.unlock();
+  if (!running) { voice.stopAll(); return; }
+  stopGuidance("그만 버튼");
+});
+
+voice.onIntent(handleIntent);
+
+// #dev 입력
+els.findBtn.addEventListener("click", () => {
+  updateDefaultTarget();
+  if (!running) { setStatus("먼저 시작 버튼을 누르세요", "warn"); return; }
+  const v = els.targetInput.value.trim();
+  if (!defaultTarget) { if (v) handleIntent({ type: "find", text: `${v} 찾아줘`, name: v, object: null, empty: false }); return; }
+  startTask(defaultTarget);
+});
+els.cmdBtn.addEventListener("click", () => {
+  const text = els.cmdInput.value.trim();
+  if (text) voice.simulate(text);
+});
+els.cmdInput.addEventListener("keydown", (e) => { if (e.key === "Enter") els.cmdBtn.click(); });
+els.targetInput.addEventListener("change", updateDefaultTarget);
+for (const input of [els.serverInput, els.keyInput]) input.addEventListener("change", readConfig);
+els.sizeSelect.addEventListener("change", () => {
+  srv.slowCount = 0; // 직접 고르면 느림 횟수 초기화
+  readConfig();
+});
+els.qrBtn.addEventListener("click", showQr);
+els.qrCloseBtn.addEventListener("click", hideQr);
+document.addEventListener("keydown", (e) => { if (e.key === "Escape" && !els.qrModal.hidden) hideQr(); });
+els.othersBtn.addEventListener("click", () => {
+  showOthers = !showOthers;
+  els.othersBtn.setAttribute("aria-pressed", String(showOthers));
+  els.othersBtn.textContent = showOthers ? "찾는 물체만" : "다른 물체 보기";
+});
+window.addEventListener("hashchange", applyHash);
+
+// 화면 확대·길게 눌러 메뉴 막기 (#dev 입력칸 제외)
+document.addEventListener("gesturestart", (e) => e.preventDefault(), { passive: false });
+document.addEventListener("contextmenu", (e) => { if (!e.target.closest(".dev-panel")) e.preventDefault(); });
+document.addEventListener("touchmove", (e) => {
+  if (e.touches.length > 1 || !e.target.closest(".dev-panel, .modal")) e.preventDefault();
+}, { passive: false });
+
+// =====================================================================
+// 초기화: 설정 읽기 → 브라우저 확인 → 모델 미리 불러오기
+// =====================================================================
+initEncoder();
+applyHash();
+checkBrowser();
+renderStats();
+renderStateLine();
+ensureModels().catch((err) => {
+  // 시작 버튼을 누르면 다시 시도함
+  console.warn("모델 미리 불러오기 실패", err);
+});
+</script>
+</body>
+</html>

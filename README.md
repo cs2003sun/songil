@@ -1,226 +1,168 @@
-# YOLOE 물건 찾기 API 서버 (GPU · 다중 사용자)
+﻿# 손길
 
-```
-yoloe-api/
-├── server.py        # 서버 (python3 -m uvicorn server:app ...)
-├── vocab.py         # 공유 어휘 231개 + 동의어 그룹 + 별칭 + 전체 탐지 때 뺄 배경 물체
-├── prompt.txt       # /describe 기본 Gemini 프롬프트
-├── describe_test.html  # /describe-test 페이지 (프롬프트 고쳐가며 시험)
-├── static/          # /app 으로 제공되는 웹 앱 (index.html 등, 직접 넣기)
-│   └── audio/       # 미리 생성한 안내 음성 + manifest.json (cache/ 는 /tts 캐시, git 제외)
-├── elevenlabs_tts.py  # ElevenLabs 호출 공용 코드
-├── pregen_tts.py    # 안내 음성 미리 생성
-├── run.sh           # tmux 세션 server / tunnel 실행
-├── loadtest.py      # 부하 테스트
-├── test_detect.py   # 단건 테스트 (/detect, /describe)
-├── requirements.txt
-├── .gitignore
-└── .env.example
-```
+### 물건 찾기부터 손 안내까지
 
-## 1. 설치 (GCP Deep Learning VM, 한 번만)
+**손길은 찾고 싶은 물건을 말하면, 스마트폰 카메라로 물건을 찾고 손을 뻗을 방향까지 안내하는 모바일 웹 서비스입니다.**
 
-```bash
-sudo apt install -y tmux git
-cd ~/yoloe-api
+시각장애인과 저시력 사용자의 일상 속 물건 찾기를 돕기 위해 만들었습니다. “컵 찾아줘”라고 말하면 물건의 위치를 찾고, 손과 물건의 상대적인 위치를 바탕으로 화면·음성·진동 안내를 제공합니다.
 
-# 이미 설치된 torch 버전을 고정해서, 다른 패키지 설치 중에 torch가 바뀌지 않게 함
-python3 - > constraints.txt <<'PY'
-import importlib.metadata as m
-for p in ("torch", "torchvision", "torchaudio"):
-    try: print(f"{p}=={m.version(p)}")
-    except m.PackageNotFoundError: pass
-PY
-cat constraints.txt
-python3 -m pip install -r requirements.txt -c constraints.txt
+> 이 저장소는 손길의 프론트엔드입니다. 물체 탐지, 명령 해석, 잡는 방법 설명, 음성 생성은 별도의 백엔드 API와 연동합니다.
 
-# 확인: torch 버전이 그대로이고 cuda가 True
-python3 -c "import torch, ultralytics; print(torch.__version__, torch.cuda.is_available(), ultralytics.__version__)"
-```
+## 기획 의도
 
-cloudflared 설치:
+물건이 어디에 있는지 알아도, 손을 어느 방향으로 움직여야 하는지와 어느 부분을 잡아야 하는지는 별개의 문제입니다. 손길은 **물건을 찾는 순간부터 손을 가까이 가져가는 과정까지** 이어서 돕는 데 초점을 맞췄습니다.
 
-```bash
-curl -L -o cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
-sudo dpkg -i cloudflared.deb
-```
+별도 장비나 앱 설치 없이 스마트폰 브라우저에서 사용할 수 있도록 구현했고, 화면을 계속 확인하기 어려운 상황을 고려해 짧은 음성 안내와 진동을 함께 사용했습니다.
 
-## 2. 설정
+## 실제 실행 화면
 
-```bash
-cp .env.example .env
-python3 -c "import secrets; print(secrets.token_urlsafe(32))"   # API_KEY 로 사용
-nano .env        # API_KEY, GEMINI_API_KEY, ELEVENLABS_API_KEY, ELEVENLABS_VOICE_ID, (고정 주소면) TUNNEL_TOKEN
-```
+컵을 찾고 손을 안내하는 과정과 가위의 손잡이 확인·주의 안내를 담았습니다.
 
-prompt.txt 의 `{대상}`은 `/describe` 요청의 `target`(없으면 `DESCRIBE_DEFAULT_TARGET`, 기본 "가운데 물건"), `{대상을}`은 받침에 맞춰 "컵을"·"텀블러를"로 바뀝니다. `{현재시간}`은 요청 때마다 서버 시각(TIMEZONE, 기본 Asia/Seoul) 기준으로 바뀝니다: 5~11시 아침, 12~17시 오후, 그 밖은 저녁 (VLM 테스트 페이지와 같은 기준). `#`으로 시작하는 줄은 보내지 않고, 파일을 고치면 서버를 다시 켜지 않아도 다음 요청부터 반영됩니다.
+### 1. 화면을 누르고, 찾을 물건 말하기
 
-프롬프트를 고쳐가며 시험하려면 브라우저에서 `https://주소/describe-test`를 여세요. 텍스트 상자에 prompt.txt 내용이 기본값으로 들어 있고, 고친 내용은 그 요청에만 쓰입니다 (prompt.txt는 바뀌지 않음). 사진 위 손잡이 점 표시, 문장 읽어주기, 빠진 항목·안심 표현 점검이 있습니다. 발표 때는 `.env`에서 `TEST_PAGE=0`으로 끌 수 있습니다.
+<table>
+  <tr>
+    <th width="33%">시작</th>
+    <th width="33%">카메라 준비</th>
+    <th width="33%">음성 입력</th>
+  </tr>
+  <tr>
+    <td align="center"><img src="readme_images/Screenshot_20261114_170800_Samsung%20Browser.jpg" width="240" alt="손길 시작 화면. 화면 어디든 눌러 카메라와 음성 안내를 시작합니다." /></td>
+    <td align="center"><img src="readme_images/Screenshot_20261114_170809_Samsung%20Browser.jpg" width="240" alt="카메라 준비 완료 후 찾을 물건을 말하도록 안내하는 화면" /></td>
+    <td align="center"><img src="readme_images/Screenshot_20261114_170819_Samsung%20Browser.jpg" width="240" alt="말하기 버튼을 눌러 음성을 입력하는 화면" /></td>
+  </tr>
+  <tr>
+    <td>화면 어디든 누르면 시작합니다.</td>
+    <td>말하기 버튼으로 탐색을 준비합니다.</td>
+    <td>“컵 찾아줘”처럼 찾을 물건을 말합니다.</td>
+  </tr>
+</table>
 
-### ElevenLabs 음성 설정
+### 2. 물건을 찾고, 손을 뻗을 방향 안내받기
 
-`.env`에 아래 항목을 채웁니다. 키는 서버에만 있고 응답·로그에는 나오지 않습니다.
+<table>
+  <tr>
+    <th width="33%">손잡이 위치 표시</th>
+    <th width="33%">손 이동 안내</th>
+    <th width="33%">목표 위치 정렬</th>
+  </tr>
+  <tr>
+    <td align="center"><img src="readme_images/Screenshot_20261114_170921_Samsung%20Browser.jpg" width="240" alt="컵을 인식하고 손잡이 위치를 표시한 화면" /></td>
+    <td align="center"><img src="readme_images/Screenshot_20261114_170953_Samsung%20Browser.jpg" width="240" alt="손 관절을 추적하며 오른쪽으로 손을 움직이도록 안내하는 화면" /></td>
+    <td align="center"><img src="readme_images/Screenshot_20261114_171002_Samsung%20Browser.jpg" width="240" alt="손과 목표 위치가 화면상 정렬되어 거기예요라고 안내하는 화면" /></td>
+  </tr>
+  <tr>
+    <td>컵과 잡을 위치를 표시합니다.</td>
+    <td>손의 위치에 따라 이동 방향을 알려줍니다.</td>
+    <td>화면상 위치가 맞으면 마지막 안내를 제공합니다.</td>
+  </tr>
+</table>
 
-| 항목 | 설명 |
-|---|---|
-| `ELEVENLABS_API_KEY` | ElevenLabs 대시보드 → API Keys 에서 만든 키 |
-| `ELEVENLABS_VOICE_ID` | 쓸 목소리 ID (Voices 화면에서 목소리 → ID 복사) |
-| `ELEVENLABS_PREGEN_MODEL` | 미리 생성용, 기본 `eleven_v3` (가장 자연스럽고 감정 표현이 풍부, 느리고 비쌈) |
-| `ELEVENLABS_LIVE_MODEL` | 실시간 생성용, 기본 `eleven_flash_v2_5` (약 75ms, 한국어 지원, 글자당 비용 낮음) |
-| `ELEVENLABS_STABILITY` 등 4개 | 비우면 그 목소리의 기본값. `eleven_v3`는 안정성을 0.0/0.5/1.0 세 단계로만 받으므로 가장 가까운 값으로 맞춰 보냅니다 |
-| `TTS_DAILY_CHAR_LIMIT` | 실시간 생성 하루 글자 수 상한 (서버 전체, 기본 30000. 동시 사용자 수에 맞춰 조정, TIMEZONE 기준 자정에 초기화) |
+### 3. 날카로운 물건은 손잡이 확인과 주의 안내
 
-요청은 ElevenLabs 공식 API(`POST /v1/text-to-speech/{voice_id}`, `xi-api-key` 헤더, `mp3_44100_128`)로 보내고, 한국어로 읽도록 `language_code: "ko"`를 함께 보냅니다.
+<table>
+  <tr>
+    <th width="33%">손잡이 확인 대기</th>
+    <th width="33%">잡을 위치 표시</th>
+    <th width="33%">주의 안내</th>
+  </tr>
+  <tr>
+    <td align="center"><img src="readme_images/Screenshot_20261114_171107_Samsung%20Browser.jpg" width="240" alt="가위의 손잡이를 확인하는 동안 손을 잠시 멈추도록 안내하는 화면" /></td>
+    <td align="center"><img src="readme_images/Screenshot_20261114_171131_Samsung%20Browser.jpg" width="240" alt="가위 손잡이에 잡을 위치를 표시한 화면" /></td>
+    <td align="center"><img src="readme_images/Screenshot_20261114_171214_Samsung%20Browser.jpg" width="240" alt="날카로운 가위 날을 주의하고 손잡이를 잡도록 안내하는 화면" /></td>
+  </tr>
+  <tr>
+    <td>손잡이를 확인할 때까지 손 이동을 기다립니다.</td>
+    <td>확인한 잡을 위치를 화면에 표시합니다.</td>
+    <td>붉은 안내 패널과 음성으로 주의를 전달합니다.</td>
+  </tr>
+</table>
 
-### 안내 음성 미리 생성 (pregen_tts.py)
+## 주요 기능
 
-`~/app/phrases.json`에 id별 문장 목록을 씁니다. id는 파일 이름이 되므로 영문·숫자·`_`·`-`만 씁니다.
+| 기능 | 구현 내용 |
+| --- | --- |
+| 음성으로 물건 찾기 | 말하기 버튼을 누르고 물건 이름을 말하면 명령을 해석해 탐색을 시작합니다. |
+| 물체 탐지와 추적 | 백엔드 YOLOE 탐지 결과로 목표 물체를 추적하고, 서버 탐지 실패 시 기기 내 EfficientDet Lite0로 대체합니다. |
+| 단계별 이동 안내 | **찾기 → 맞추기 → 손 뻗기** 순서로, 휴대폰을 움직일 때와 손을 움직일 때를 구분해 안내합니다. |
+| 손과 잡을 위치 연결 | MediaPipe로 손을 추적하고, 백엔드가 추정한 잡을 위치를 기준으로 이동 방향을 계산합니다. |
+| 음성·화면·진동 피드백 | 짧은 안내 문장, 큰 글씨와 방향 아이콘, 상태별 색상과 진동을 함께 제공합니다. |
+| 위험 상황 안내 | 날카로운 물건은 손잡이를 먼저 확인하고, 손이 추정 칼날 구역에 들어오면 경고합니다. |
+| 탐색 중지 | 탐색 중에는 버튼이 ‘그만’으로 바뀌며, 누르면 안내와 진행 중인 요청을 중지합니다. |
 
-```json
-{
-  "searching": ["찾아볼게요.", "주변을 살펴볼게요."],
-  "found": ["찾았어요!", "여기 있어요."],
-  "lost": ["화면에서 사라졌어요. 폰을 천천히 움직여 주세요."]
-}
-```
+## 사용 방법
 
-```bash
-python3 pregen_tts.py --dry-run            # 만들 문장 수와 글자 수만 확인 (크레딧 쓰지 않음)
-python3 pregen_tts.py                      # 없는 파일만 생성
-python3 pregen_tts.py --only found,lost    # 이 id만
-python3 pregen_tts.py --only found --force # 이 id를 다시 생성 (문장을 고쳤을 때)
-python3 pregen_tts.py --phrases ./phrases.json   # 다른 위치의 목록
-```
+1. 스마트폰 브라우저에서 서비스를 열고 **시작**을 누릅니다. 카메라·마이크 권한을 허용합니다.
+2. **말하기** 버튼을 누른 뒤 “컵 찾아줘”처럼 찾을 물건을 말합니다.
+3. 휴대폰 방향 안내에 따라 주변을 천천히 비춥니다.
+4. 물건을 찾으면 휴대폰을 유지한 채 손을 카메라에 보이게 합니다.
+5. “오른쪽으로”, “몸 쪽으로” 같은 안내에 따라 손을 움직입니다.
+6. 손과 목표 위치가 화면상 정렬되면 마지막 안내 후 탐색을 종료합니다. 중간에 멈추려면 **그만** 버튼을 누릅니다.
 
-- 결과: `static/audio/found_1.mp3`, `found_2.mp3` … → 웹 주소 `/app/audio/found_1.mp3` (API 키 없이 열림)
-- `static/audio/manifest.json`: `{"found": 2, ...}` → 앱은 1~N 중 하나를 골라 재생하면 됩니다
-- 실패한 문장은 2번 더 시도하고, 그래도 안 되면 끝에 목록으로 보여줍니다. 다시 실행하면 없는 파일만 만듭니다.
-- manifest에는 1번부터 빠짐없이 있는 파일 개수만 적습니다. 중간 번호가 실패하면 그 id의 개수가 줄어들어 앱이 없는 파일을 부르지 않습니다.
-- 마지막에 생성한 문장 수와 글자 수를 출력합니다. 크레딧은 이 글자 수에 모델·요금제의 글자당 단가를 곱한 값입니다.
-- 문장을 고친 id는 `--force`로 다시 만들어야 합니다 (이미 있는 파일은 건너뛰므로).
+**시연 포인트:** 컵으로 음성 입력부터 손 안내까지 확인한 뒤, 가위 인식 시 손잡이를 먼저 확인하는 흐름과 주의 안내를 확인할 수 있습니다.
 
-고정 주소 터널: Cloudflare Zero Trust → Networks → Tunnels → Create a tunnel 에서 토큰을 받아 `.env`의 `TUNNEL_TOKEN`에 넣고, Public Hostname 을 `HTTP` / `127.0.0.1:8000`으로 지정합니다. 비워두면 실행할 때마다 바뀌는 `*.trycloudflare.com` 주소를 씁니다.
+## 구현에서 신경 쓴 점
 
-## 3. 실행
+- **조작을 단순하게 구성했습니다.** 시작 화면 전체를 누를 수 있게 하고, 카메라 화면에서는 하나의 큰 버튼으로 말하기와 중지를 처리합니다.
+- **현재 해야 할 행동을 짧게 전달합니다.** 휴대폰 방향 맞추기와 손 이동을 단계로 나누고, 재생 중인 음성에 맞춰 화면 안내를 유지합니다.
+- **인식이 잠깐 끊겨도 안내가 흔들리지 않도록 했습니다.** 목표 물체를 고정해 추적하고, 물건을 놓치면 다시 찾을 방향을 안내합니다.
+- **서버와 브라우저의 역할을 나눴습니다.** 물체 탐지와 설명은 백엔드가, 손 추적과 방향 계산은 브라우저가 담당합니다. 손 추적은 Web Worker에서 실행합니다.
 
-```bash
-bash run.sh          # 서버 + 터널 시작, 임시 주소 출력, 모델 준비까지 대기
-bash run.sh status   # 세션·/health·임시 주소
-bash run.sh stop
-tmux attach -t server   # 로그 보기 (나오기: Ctrl+b, d)
-```
+## 기술 스택 및 구조
 
-run.sh 는 내부에서 `python3 -m uvicorn server:app --host 127.0.0.1 --port 8000 --workers 1`을 실행합니다. 워커는 반드시 1개여야 합니다.
+```mermaid
+flowchart TB
+  subgraph Phone["휴대폰 브라우저 (모바일 웹 앱)"]
+    UI["React 19 · TypeScript · Vite"]
+    MP["MediaPipe (Web Worker)<br/>손 추적 · 대체 물체 탐지"]
+    STT["Web Speech API<br/>음성 명령 인식 · 대체 음성"]
+    AUD["Web Audio · Vibration · Wake Lock"]
+  end
 
-## 4. 테스트
+  subgraph Vercel["Vercel"]
+    HOST["정적 호스팅<br/>Git push 자동 배포"]
+    PROXY["Vercel Function 프록시<br/>API 키 서버 보관"]
+  end
 
-```bash
-export API_KEY=...   # .env 와 같은 값
-python3 test_detect.py 사진.jpg --targets "cup,remote control" --repeat 5
-python3 test_detect.py 컵_잘라낸.jpg --describe
-curl -s -D - -o test.mp3 -H "X-API-Key: $API_KEY" -H 'Content-Type: application/json' \
-     -d '{"text":"보드마카 찾아볼게요"}' http://127.0.0.1:8000/tts | grep -i x-tts
-python3 loadtest.py 사진.jpg --users 30 --duration 60
-python3 loadtest.py 사진.jpg --users 30 --url https://주소   # 터널까지 포함해서
-curl -s -H "X-API-Key: $API_KEY" http://127.0.0.1:8000/stats | python3 -m json.tool
-```
+  subgraph GCP["GCP GPU 서버 (Deep Learning VM)"]
+    CF["Cloudflare Tunnel<br/>HTTPS 공개 주소"]
+    API["FastAPI · Uvicorn<br/>인증 · 요청 제한 · 배치 대기열"]
+    YOLO["YOLOE-26 (Ultralytics)<br/>PyTorch · CUDA · FP16"]
+    CV["OpenCV<br/>HSV 색상 필터"]
+  end
 
-요청별 기록은 `logs/requests_날짜_시각.csv`에 쌓입니다 (서버를 켤 때마다 새 파일). IP와 기기 ID는 해시로만 남습니다.
+  subgraph AI["외부 AI API"]
+    GEM["Google Gemini<br/>명령 해석 · 잡는 법 설명"]
+    EL["ElevenLabs<br/>한국어 음성 합성"]
+  end
 
-## API
-
-`/app`, `/describe-test`를 뺀 모든 엔드포인트는 `X-API-Key` 헤더가 필요합니다. 폰 앱은 `X-Client-Id`(기기마다 다른 임의 문자열)도 보내는 것을 권장합니다.
-
-**POST /detect** (multipart): `image`, `targets`(선택, "cup,key"), `conf`(0.25), `imgsz`(640)
-
-- `targets`가 있으면 `mode: "targets"`: 그 물체만 찾습니다 (최대 10개 이름).
-- `targets`에 색 단어(black, white, gray/grey/silver, red, orange, yellow, green, blue, purple, pink, brown)가 있으면 색상 필터를 씁니다. 예: `targets="red cup,cup"`
-  - YOLOE에는 색을 뺀 이름(`cup`)만 보내 형태로 찾고, 박스의 상하좌우 25%를 뺀 중앙 50% 영역에서 그 색 픽셀(HSV 기준) 비율을 잽니다.
-  - 비율이 `COLOR_MIN_RATIO`(0.30) 이상인 박스만 남기고, `score`를 `score × (0.6 + 0.4 × 일치율)`로 바꿔 다시 정렬합니다. 각 박스에 `color_match`(0~1)가 붙습니다.
-  - 색이 달라 빠진 박스는 `color_rejected`에 `label`, `box`, `dominant_color`(가장 많은 색, 20% 미만이면 unknown)와 함께 최대 5개 들어갑니다.
-  - 분홍은 빨강·보라 기준과 겹치므로, 빨강·보라 일치율을 셀 때는 분홍 픽셀을 뺍니다 (`COLOR_EXCLUDE`). 그래서 `red cup`으로 찾으면 분홍 컵은 빠집니다.
-  - 색 기준값은 server.py 맨 위 `COLOR_HSV_RULES`에서 고칩니다. 색이 없는 요청은 `color_filter: null`, `color_rejected: []`이고 결과는 전과 같습니다.
-- `targets`가 없거나 비어 있으면 `mode: "all"`: 기본 어휘 전체에서 찾되 배경 물체(table, desk, chair, person, window, door 등, vocab.py의 `BACKGROUND`)는 빼고 신뢰도 높은 순으로 최대 20개(`MAX_RESULTS_ALL`)를 돌려줍니다. 이때 `target`은 `label`과 같고 색상 필터는 쓰지 않습니다.
-
-```json
-{
-  "mode": "targets",
-  "detections": [
-    {"label": "mug", "target": "cup", "score": 0.79, "color_match": 0.82,
-     "box": {"x": 0.11, "y": 0.21, "w": 0.39, "h": 0.39}}
-  ],
-  "color_filter": "red",
-  "color_rejected": [{"label": "cup", "box": {"x": 0.6, "y": 0.3, "w": 0.2, "h": 0.3}, "dominant_color": "blue"}],
-  "vocab_pending": [],
-  "timing_ms": {"decode": 3.1, "vocab_update": 0, "queue_wait": 12.4, "inference": 28.7, "color": 0.6, "total": 46.6},
-  "batch_size": 6, "device": "cuda", "model": "yoloe-26l-seg.pt"
-}
+  UI --> PROXY
+  HOST -.-> UI
+  PROXY --> CF --> API
+  API --> YOLO --> CV
+  API --> GEM
+  API --> EL
 ```
 
-`label`은 모델이 인식한 어휘 이름, `target`은 그 결과가 어떤 요청 이름 때문에 포함됐는지입니다 (동의어 그룹: cup을 요청하면 mug·tumbler 등도 찾음). 같은 물건이 두 이름으로 겹쳐 잡히면(cup/mug처럼 같은 요청 이름이나 같은 동의어 그룹) 점수 높은 것 하나만 남깁니다. 다른 물건끼리는 많이 겹쳐도 지우지 않으므로, 앞의 컵이 뒤의 물병을 가려도 둘 다 나옵니다. `phone`→`cell phone`, `keys`→`key` 같은 별칭과 간단한 복수형은 자동으로 바꿉니다.
+| 구분 | 기술 | 역할 |
+| --- | --- | --- |
+| 프론트엔드 | React 19, TypeScript 5.9 | 화면 구성, 상태 관리, 안내 로직 |
+| 개발·빌드 | Vite 7 | 개발 서버, HTTPS 개발 모드, 프로덕션 빌드 |
+| 손 추적·로컬 탐지 | MediaPipe Tasks Vision, Web Worker, WASM | 손 관절 추적, 서버 탐지 실패 시 로컬 물체 탐지 |
+| 음성·피드백 | Web Speech API, Web Audio API, Vibration API | 음성 입력, 안내 음성·효과음 재생, 진동 |
+| 백엔드 연동 | Fetch API, YOLOE 및 명령·설명·TTS API | 물체 탐지, 명령 해석, 잡을 위치와 주의사항 추정 |
+| 배포 구성 | Vercel | 정적 파일 제공, `/api` 요청 중계 |
 
-**어휘에 없는 이름:** 어휘를 바꾸는 동안은 모든 사용자의 추론이 잠깐 멈추므로, 되도록 바꾸지 않습니다.
-- 이름의 뒷부분이 어휘에 있으면 그 이름으로 찾습니다 (`plastic water bottle` → `water bottle`, 어휘 변경 없음).
-- 그래도 없으면 요청은 기다리지 않고 바로 응답하고, 그 이름을 `vocab_pending`에 담아 돌려줍니다. 서버가 새 이름들을 모아 `VOCAB_UPDATE_INTERVAL`(5초)에 한 번씩 어휘에 추가하고, 추가된 뒤의 사진부터 찾습니다.
-- 어휘를 추가할 때 오래 걸리는 텍스트 임베딩 계산은 추론을 멈추지 않고 먼저 하고, 모든 추론이 멈추는 구간은 어휘 재설정(`set_classes`)과 예비 추론 한 번뿐입니다. 서버 로그의 `추론 멈춤: set_classes=…ms predictor 재준비=…ms`로 실제 시간을 확인할 수 있습니다.
-- 그 멈춘 시간은 `REQUEST_TIMEOUT`(1.5초) 계산에서 빼므로, 어휘 추가 때문에 다른 사용자의 사진이 503으로 버려지지 않습니다 (`VOCAB_STALL_EXEMPT=0`이면 예전처럼 포함).
-- `/health`의 `vocab_pending`은 추가를 기다리는 이름 수입니다. `/stats`의 `extra_words_top`은 기본 어휘 밖에서 자주 요청된 이름입니다. 자주 나오는 이름은 vocab.py의 기본 어휘에 넣으면 어휘 추가 자체가 없어집니다.
-
-**POST /describe** (multipart): `image`, `target`(선택, 설명할 물건 예: "검은 텀블러"), `prompt`(선택, 비우면 prompt.txt) → `{"result": {Gemini가 만든 JSON}, "safety_removed", "model", "attempts", "time_of_day", "target", "prompt_source", "custom_prompt_ignored", "timing_ms"}`
-
-- 기본 프롬프트의 결과에는 `hazard`(`hot`·`spill`·`edge`·`broken`·`sharp`·null)가 들어 있고, `safety`는 hazard가 있을 때만 채워집니다.
-- 서버가 어떤 프롬프트로 받은 결과든 `safety`를 한 번 더 거릅니다. hazard가 목록 밖이거나 없을 때, 일반 취급 주의(액정·화면·충전·떨어뜨리기 등)일 때, 안심시키는 말("뜨겁지 않아요" 등)일 때 `safety`를 null로 바꾸고 `safety_removed`에 이유(`no_hazard`·`generic_caution`·`reassuring`)를 적습니다. 앱이 `safety`가 있을 때만 경고를 띄운다면 앱을 고치지 않아도 경고 남발이 줄어듭니다.
-- `ALLOW_CUSTOM_PROMPT=0`이면 앱이 보낸 `prompt`는 무시하고 prompt.txt를 씁니다 (`custom_prompt_ignored: true`). `/describe-test` 페이지에서 보낸 것은 계속 허용합니다. **끄기 전에 앱이 `/describe`에 `target`을 보내는지 먼저 확인하세요.** 보내지 않으면 모든 물건을 "가운데 물건"으로 질의합니다.
-
-**POST /parse** (JSON): `{"text": "내 검은 텀블러 어디 있어?"}` → 한국어 음성 명령을 Gemini로 해석
-
-```json
-{
-  "intent": "where", "object_ko": "검은 텀블러", "targets": ["black tumbler", "tumbler"],
-  "cached": false, "attempts": 1, "timing_ms": {"vlm": 412.3, "total": 413.0}
-}
+```mermaid
+flowchart TD
+    A[사용자의 음성 명령] --> B[브라우저 음성 인식]
+    B --> C[백엔드 명령 해석]
+    D[카메라 영상] --> E[백엔드 물체 탐지·잡을 위치 추정]
+    C --> E
+    D --> F[브라우저 MediaPipe 손 추적]
+    E --> G[프론트엔드 좌표 변환·방향 계산]
+    F --> G
+    G --> H[화면·음성·진동 안내]
 ```
 
-`intent`는 find / where / how / stop / unknown이고 서버가 바꾸지 않습니다. "잡았어", "잡았다", "이제 됐어", "고마워"도 `stop`이므로, 앱은 `stop`을 받으면 안내를 끝내면 됩니다. 그중 "컵 잡았어", "손에 잡혔어"처럼 물건을 쥐었다는 말이면 `grabbed: true`가 함께 오므로, 앱은 "안내를 멈췄어요" 대신 완료로 처리하면 됩니다. `where`라도 문장에 물건 이름이 있으면 `object_ko`와 `targets`를 둘 다 채워서 돌려주므로, 앱은 `object_ko`를 지금 찾는 물건과 비교해 새 물건인지 판단하면 됩니다. 둘 중 하나만 채워져 오면 Gemini에 한 번 더 묻고, 그래도 같으면 받은 결과를 그대로 돌려줍니다. "이거 어떻게 잡아?"처럼 물건 이름이 없으면 `object_ko: null`, `targets: []`입니다. `targets`는 0~3개의 영어 소문자 이름으로 `/detect`의 `targets`에 그대로 넣을 수 있습니다. Gemini 제한 시간은 시도당 `PARSE_TIMEOUT`(5초)이고, 시간 초과면 다시 시도하지 않고 바로 `504 vlm_timeout`을 돌려줍니다 (`/describe`는 `GEMINI_TIMEOUT` 20초). 같은 문장(공백과 끝의 ?·! 차이는 무시)은 메모리에 저장한 결과를 `PARSE_CACHE_TTL`(10분) 동안 다시 쓰고(`cached: true`), `unknown`이나 물건 이름이 빠진 결과는 저장하지 않습니다. 해석이 틀렸으면 `{"text": ..., "refresh": true}`로 보내 다시 해석할 수 있습니다. 기기(`X-Client-Id`, 없으면 IP)별로 분당 20회까지 받습니다. CSV에는 음성 문장 대신 해석된 targets만 남깁니다. 문장에 색 형용사(빨간, 까만, 은색, 분홍 등)가 있으면 targets 첫 번째가 `"red cup"`처럼 영어 색 단어 + 물건 이름이 되므로, 그대로 `/detect`에 넘기면 색상 필터가 적용됩니다. Gemini가 색을 빼먹으면 서버가 보충합니다.
-
-**POST /tts** (JSON): `{"text": "보드마카 찾아볼게요"}` → `audio/mpeg` (MP3)
-
-- 실시간 모델(`ELEVENLABS_LIVE_MODEL`)로 만들고, 같은 문장·목소리·모델·음성 설정이면 `static/audio/cache/{해시}.mp3`에 저장한 파일을 다시 씁니다 (앞뒤·연속 공백은 무시).
-- 응답 헤더: `X-TTS-Source`(`cache` 또는 `generated`), `X-TTS-Ms`(생성에 걸린 ms, 캐시는 0), `X-TTS-Url`(같은 음성의 GET 주소 `/app/audio/cache/{해시}.mp3`). 앱은 이 주소를 문장별로 저장해 두면 다음부터 `/tts`를 부르지 않고 브라우저 캐시로 바로 재생할 수 있습니다. 이 캐시 파일들은 `Cache-Control: public, max-age=31536000, immutable`로 제공됩니다 (파일 이름이 문장·목소리·모델·설정의 해시라 내용이 바뀌지 않음).
-- 기기(`X-Client-Id`, 없으면 IP)별 분당 60회(`TTS_RATE_PER_MIN`)는 **새로 생성할 때만** 셉니다. 저장된 문장은 몇 번을 요청해도 제한에 걸리지 않습니다. 200자 초과는 `400 text_too_long`
-- 하루 생성 글자 수가 `TTS_DAILY_CHAR_LIMIT`를 넘으면 `429 tts_daily_limit` (`Retry-After`는 자정까지 남은 초). 캐시된 문장은 계속 나갑니다. 사용량은 `logs/tts_usage.json`에 남아 서버를 다시 켜도 유지됩니다.
-- ElevenLabs 쪽 문제(키 오류, 설정 값 오류, 8초 시간 초과, 크레딧 부족 등)는 `502`와 이유를 JSON으로 돌려줍니다. 앱은 200이 아니면 브라우저 음성(speechSynthesis)으로 대체하면 됩니다.
-- 같은 문장이 동시에 여러 번 오면 ElevenLabs는 한 번만 부릅니다. 호출은 비동기라 그동안 `/detect`는 그대로 처리됩니다.
-
-```js
-// 앱 예시: 실패하면 브라우저 음성으로
-async function speak(text) {
-  try {
-    const r = await fetch('/tts', { method: 'POST',
-      headers: { 'X-API-Key': KEY, 'X-Client-Id': DEVICE_ID, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text }) });
-    if (!r.ok) throw new Error(r.status);
-    const audio = new Audio(URL.createObjectURL(await r.blob()));
-    await audio.play();
-  } catch {
-    const u = new SpeechSynthesisUtterance(text); u.lang = 'ko-KR'; speechSynthesis.speak(u);
-  }
-}
-```
-
-**GET /app/** : `static/` 폴더의 파일을 API 키 없이 제공합니다. `/app/`은 `static/index.html`, `/app`은 `/app/`으로 이동합니다. 미리 생성한 음성은 `/app/audio/{id}_{번호}.mp3`, 목록은 `/app/audio/manifest.json`입니다. 폴더 위치는 환경변수 `STATIC_DIR`로 바꿀 수 있습니다.
-
-**GET /health**: `status`, `model_loaded`, `model`, `device`, `half`, `vocab_size`, `queue_length`, `describe_enabled`, `tts_enabled`(ElevenLabs 설정 여부), `tts_today_chars`(오늘 실시간 생성 글자 수), `tts_daily_limit`
-
-**GET /stats**: 최근 5분 `detect`/`describe`/`parse`/`tts`별 요청 수·성공 수·avg/p50/p95(ms)·429·503 횟수, `batch.avg_size`, `unique_ips`, `unique_clients`, `queue_length`, `extra_words_top`(기본 어휘 밖에서 자주 요청된 이름), `vocab_stall_ms_total`(어휘 추가로 추론이 멈춘 누적 시간)
-
-| 상태 | code | 상황 |
-|---|---|---|
-| 400 | `invalid_image`, `invalid_targets`, `invalid_text`, `text_too_long` | 이미지를 못 읽음 / 이름 형식 오류 / 문장이 비었거나 너무 김 |
-| 401 | `unauthorized` | API 키 불일치 |
-| 429 | `rate_limited`, `tts_daily_limit` | /detect 초당 5회, /describe 분당 10회, /parse 분당 20회, /tts 분당 30회 초과 / 오늘 음성 생성 한도 초과 (`Retry-After` 헤더) |
-| 502/504 | `vlm_error`, `vlm_invalid_json`, `vlm_timeout` 등 | Gemini 쪽 문제 |
-| 502 | `tts_error`, `tts_timeout`, `tts_unreachable`, `tts_bad_audio` | ElevenLabs 쪽 문제 → 앱은 브라우저 음성으로 대체 |
-| 503 | `queue_full`, `timeout` | 잠깐 혼잡해서 이번 사진만 처리 못 함. `Retry-After: 1`이 붙으므로 앱은 다음 사진을 그대로 보내면 됨 (여러 번 연속 실패할 때만 기기 내 인식으로 전환 권장) |
-| 503 | `model_loading` | 서버 시작 직후 모델 준비 중 |
-| 503 | `tts_disabled` | ElevenLabs 키·목소리 ID가 없거나 음성 설정 값이 숫자가 아님 |
+탐지·설명을 위해 캡처한 이미지는 백엔드로 전송합니다. 손 추적은 브라우저 내부에서 처리하며, 안내 음성은 **고정 녹음 → 서버 TTS → 브라우저 TTS** 순으로 대체할 수 있도록 구성했습니다.

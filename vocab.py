@@ -76,6 +76,15 @@ for _group in (ESSENTIALS, KITCHEN, PERSONAL, ELECTRONICS, CLOTHING, HOME, STATI
         if _w not in BASE_VOCAB:
             BASE_VOCAB.append(_w)
 
+# ---- 배경 물체 ------------------------------------------------------------
+# targets 없이 /detect 를 부를 때(전체 탐지) 결과에서 빼는 이름.
+# 가구·건물 구조·사람처럼 거의 항상 보이고 손으로 집을 물건이 아닌 것들.
+BACKGROUND: set[str] = {
+    "table", "desk", "chair", "sofa", "bed", "wall", "floor", "ceiling", "person",
+    "window", "door", "curtain", "cabinet", "shelf", "drawer", "stairs",
+    "refrigerator", "washing machine", "toilet", "sink", "bathtub", "faucet",
+}
+
 # ---- 동의어 그룹 ----------------------------------------------------------
 SYNONYM_GROUPS: list[list[str]] = [
     ["cup", "mug", "coffee cup", "paper cup", "tumbler", "glass"],

@@ -3,7 +3,7 @@
 ```
 yoloe-api/
 ├── server.py        # 서버 (python3 -m uvicorn server:app ...)
-├── vocab.py         # 공유 어휘 231개 + 동의어 그룹 + 별칭
+├── vocab.py         # 공유 어휘 231개 + 동의어 그룹 + 별칭 + 전체 탐지 때 뺄 배경 물체
 ├── prompt.txt       # /describe 기본 Gemini 프롬프트
 ├── describe_test.html  # /describe-test 페이지 (프롬프트 고쳐가며 시험)
 ├── static/          # /app 으로 제공되는 웹 앱 (index.html 등, 직접 넣기)
@@ -131,10 +131,14 @@ curl -s -H "X-API-Key: $API_KEY" http://127.0.0.1:8000/stats | python3 -m json.t
 
 `/app`, `/describe-test`를 뺀 모든 엔드포인트는 `X-API-Key` 헤더가 필요합니다. 폰 앱은 `X-Client-Id`(기기마다 다른 임의 문자열)도 보내는 것을 권장합니다.
 
-**POST /detect** (multipart): `image`, `targets`("cup,key"), `conf`(0.25), `imgsz`(640)
+**POST /detect** (multipart): `image`, `targets`(선택, "cup,key"), `conf`(0.25), `imgsz`(640)
+
+- `targets`가 있으면 `mode: "targets"`: 그 물체만 찾습니다 (최대 10개 이름).
+- `targets`가 없거나 비어 있으면 `mode: "all"`: 기본 어휘 전체에서 찾되 배경 물체(table, desk, chair, person, window, door 등, vocab.py의 `BACKGROUND`)는 빼고 신뢰도 높은 순으로 최대 20개(`MAX_RESULTS_ALL`)를 돌려줍니다. 이때 `target`은 `label`과 같습니다.
 
 ```json
 {
+  "mode": "targets",
   "detections": [
     {"label": "mug", "target": "cup", "score": 0.83, "box": {"x": 0.11, "y": 0.21, "w": 0.39, "h": 0.39}}
   ],
@@ -156,7 +160,7 @@ curl -s -H "X-API-Key: $API_KEY" http://127.0.0.1:8000/stats | python3 -m json.t
 }
 ```
 
-`intent`는 find / where / how / stop / unknown, `targets`는 0~3개의 영어 소문자 이름으로 `/detect`의 `targets`에 그대로 넣을 수 있습니다. 같은 문장(공백과 끝의 ?·! 차이는 무시)은 메모리에 저장한 결과를 다시 쓰고(`cached: true`), 기기(`X-Client-Id`, 없으면 IP)별로 분당 20회까지 받습니다. CSV에는 음성 문장 대신 해석된 targets만 남깁니다.
+`intent`는 find / where / how / stop / unknown이고 서버가 바꾸지 않습니다. `where`라도 문장에 물건 이름이 있으면 `object_ko`와 `targets`를 둘 다 채워서 돌려주므로, 앱은 `object_ko`를 지금 찾는 물건과 비교해 새 물건인지 판단하면 됩니다. 둘 중 하나만 채워져 오면 Gemini에 한 번 더 묻고, 그래도 같으면 받은 결과를 그대로 돌려줍니다. "이거 어떻게 잡아?"처럼 물건 이름이 없으면 `object_ko: null`, `targets: []`입니다. `targets`는 0~3개의 영어 소문자 이름으로 `/detect`의 `targets`에 그대로 넣을 수 있습니다. 같은 문장(공백과 끝의 ?·! 차이는 무시)은 메모리에 저장한 결과를 다시 쓰고(`cached: true`), 기기(`X-Client-Id`, 없으면 IP)별로 분당 20회까지 받습니다. CSV에는 음성 문장 대신 해석된 targets만 남깁니다.
 
 **POST /tts** (JSON): `{"text": "보드마카 찾아볼게요"}` → `audio/mpeg` (MP3)
 

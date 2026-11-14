@@ -54,7 +54,7 @@ from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from elevenlabs_tts import TTSConfig, TTSError, synthesize_async, write_atomic
-from vocab import ALIASES, BASE_VOCAB, SYNONYM_GROUPS
+from vocab import ALIASES, BACKGROUND, BASE_VOCAB, SYNONYM_GROUPS
 
 
 # ---------------------------------------------------------------------------
@@ -95,6 +95,7 @@ PARSE_MAX_CHARS = env_int("PARSE_MAX_CHARS", 200)
 RATE_LIMIT_BY = os.getenv("RATE_LIMIT_BY", "ip+client")  # "ip" 또는 "ip+client" (X-Client-Id 헤더가 있으면 함께 사용)
 
 MAX_TARGETS = env_int("MAX_TARGETS", 10)
+MAX_RESULTS_ALL = env_int("MAX_RESULTS_ALL", 20)  # targets 없이 전체 탐지할 때 최대 결과 수
 MAX_EXTRA_VOCAB = env_int("MAX_EXTRA_VOCAB", 100)  # 요청으로 추가되는 단어 최대 개수 (넘으면 오래 안 쓴 것부터 제거)
 SYNONYMS = env_bool("SYNONYMS", True)
 DEDUPE_IOU = env_float("DEDUPE_IOU", 0.6)  # 같은 물건이 cup/mug로 두 번 잡히면 하나만 남김
@@ -336,6 +337,10 @@ def parse_targets(raw: str, known: set[str]) -> list[str]:
     return out
 
 
+# targets 없이 부르면 기본 어휘에서 배경 물체를 뺀 이름 전체를 찾는다 (이름 → 이름)
+ALL_MODE_TARGETS: dict[str, str] = {w: w for w in BASE_VOCAB if w not in BACKGROUND}
+
+
 def expand_targets(requested: list[str]) -> dict[str, str]:
     """찾을 어휘 이름 → 사용자가 요청한 이름. 동의어 그룹이 켜져 있으면 같은 그룹 이름도 포함"""
     mapping: dict[str, str] = {}
@@ -380,6 +385,7 @@ class Job:
     t_enqueue: float
     future: asyncio.Future
     loop: asyncio.AbstractEventLoop
+    max_results: int | None = None  # 전체 탐지 모드에서만 개수 제한
 
 
 class Detector:
@@ -628,6 +634,8 @@ class Detector:
             if any(iou(box, kb) >= DEDUPE_IOU for kb in kept):  # 같은 물건이 다른 이름으로 또 잡힌 경우
                 continue
             kept.append(box)
+            if job.max_results is not None and len(dets) >= job.max_results:
+                break
             label = names[c]
             x1, y1, x2, y2 = (float(v) for v in box)
             dets.append({
@@ -779,6 +787,11 @@ intent
 - stop: 안내를 멈추라는 말 (예: "그만", "멈춰", "됐어", "찾았어")
 - unknown: 위에 해당하지 않거나 알아들을 수 없는 말
 
+object_ko와 targets는 intent와 상관없이 채워
+- find, where, how, stop 어느 경우든 문장에 물건 이름이 나오면 object_ko와 targets를 반드시 둘 다 채워
+- "어디 있어?"(where)도 물건 이름이 있으면 object_ko와 targets를 비우지 마
+- 물건 이름 없이 "이거", "그거"만 말했으면 object_ko는 null, targets는 빈 배열
+
 object_ko
 - 사용자가 말한 물건을 색·재질 같은 겉모습 표현까지 포함해 한국어로 (예: "검은 텀블러")
 - "내", "왼쪽에 있는", "아까 그" 같은 소유·위치·관계 표현은 빼
@@ -795,6 +808,9 @@ targets: 물체 인식 모델에 넣을 영어 물체 이름
 "약통 좀 찾아줘" → {"intent": "find", "object_ko": "약통", "targets": ["pill bottle", "medicine bottle"]}
 "왼쪽에 있는 리모컨 찾아줘" → {"intent": "find", "object_ko": "리모컨", "targets": ["remote control"]}
 "이 컵 어떻게 잡아?" → {"intent": "how", "object_ko": "컵", "targets": ["cup"]}
+"아까 그 안경 어디 있어?" → {"intent": "where", "object_ko": "안경", "targets": ["glasses", "eyeglasses"]}
+"이거 어떻게 잡아?" → {"intent": "how", "object_ko": null, "targets": []}
+"지갑 찾았어" → {"intent": "stop", "object_ko": "지갑", "targets": ["wallet"]}
 "그만해" → {"intent": "stop", "object_ko": null, "targets": []}
 "오늘 날씨 어때?" → {"intent": "unknown", "object_ko": null, "targets": []}
 
@@ -869,15 +885,30 @@ class ParseCache:
 parse_cache = ParseCache(PARSE_CACHE_SIZE)
 
 
+def parse_incomplete(result: dict) -> bool:
+    """object_ko와 targets 중 하나만 채워진 경우 (물건이 있으면 둘 다 있어야 앱이 새 물건인지 판단 가능)"""
+    return bool(result["object_ko"]) != bool(result["targets"])
+
+
 async def gemini_parse(text: str) -> tuple[dict, int]:
-    """Gemini로 해석. JSON이 아니거나 형식이 틀리면 한 번만 다시 시도. 반환: (결과, 시도 횟수)"""
-    prompt = PARSE_PROMPT.replace("{text}", json.dumps(text, ensure_ascii=False))
+    """Gemini로 해석. JSON이 아니거나 object_ko·targets 중 하나만 있으면 한 번만 다시 시도.
+    intent는 바꾸지 않는다 (where 라도 그대로). 반환: (결과, 시도 횟수)"""
+    base = PARSE_PROMPT.replace("{text}", json.dumps(text, ensure_ascii=False))
+    prompt, fallback = base, None
     for attempt in (1, 2):
         reply = await call_gemini(None, prompt)
         result = clean_parse_result(parse_json_text(reply))
-        if result is not None:
+        if result is None:
+            log.warning("/parse: Gemini 응답 형식이 맞지 않음 (시도 %d): %s", attempt, reply[:200])
+            continue
+        if not parse_incomplete(result):
             return result, attempt
-        log.warning("/parse: Gemini 응답 형식이 맞지 않음 (시도 %d): %s", attempt, reply[:200])
+        # 하나만 비어 있으면 짚어서 다시 물어봄. 두 번째도 그러면 받은 결과를 그대로 씀
+        log.warning("/parse: object_ko와 targets 중 하나가 비어 있음 (시도 %d): %s", attempt, result)
+        fallback = result
+        prompt = base + "\n\n주의: 물건 이름이 있으면 object_ko와 targets를 둘 다 채워. 물건이 없으면 둘 다 비워."
+    if fallback is not None:
+        return fallback, 2
     raise ApiError(502, "vlm_invalid_json", "Gemini 응답이 두 번 모두 올바른 JSON 형식이 아니었습니다.")
 
 
@@ -1103,13 +1134,15 @@ async def get_stats():
 async def detect(
     request: Request,
     image: UploadFile = File(..., description="JPEG 이미지"),
-    targets: str = Form(..., description="찾을 물체 영어 이름, 쉼표로 여러 개 (예: mug,cup)"),
+    targets: str = Form("", description="찾을 물체 영어 이름, 쉼표로 여러 개 (예: mug,cup). 비우면 전체 탐지"),
     conf: float = Form(DEFAULT_CONF, ge=0.0, le=1.0),
     imgsz: int = Form(DEFAULT_IMGSZ, ge=160, le=1280),
 ):
     t_start = time.perf_counter()
     ip, cid = client_ip(request), client_id(request)
-    row: dict[str, Any] = {"targets": targets[:100]}
+    # targets 가 없거나 쉼표·공백뿐이면 전체 탐지 모드
+    mode = "targets" if any(p.strip() for p in targets.split(",")) else "all"
+    row: dict[str, Any] = {"targets": targets[:100] if mode == "targets" else "*"}
     try:
         if not detector.ready:
             if detector.load_error:
@@ -1123,13 +1156,17 @@ async def detect(
         if detector.pending >= MAX_QUEUE:
             raise ApiError(503, "queue_full", "요청이 많아 지금은 처리할 수 없습니다. 기기 내 인식을 사용하세요.")
 
-        requested = parse_targets(targets, set(detector.name_to_id))
-        label_to_target = expand_targets(requested)
         vocab_ms = 0.0
-        if detector.missing_words(label_to_target):
-            vocab_ms = await run_in_threadpool(detector.ensure_words, list(label_to_target))
+        if mode == "all":
+            # 기본 어휘는 항상 모델에 설정돼 있으므로 어휘 변경 없음
+            requested, label_to_target, max_results = ["*"], ALL_MODE_TARGETS, MAX_RESULTS_ALL
         else:
-            detector.touch(label_to_target)
+            requested = parse_targets(targets, set(detector.name_to_id))
+            label_to_target, max_results = expand_targets(requested), None
+            if detector.missing_words(label_to_target):
+                vocab_ms = await run_in_threadpool(detector.ensure_words, list(label_to_target))
+            else:
+                detector.touch(label_to_target)
 
         t0 = time.perf_counter()
         img = await run_in_threadpool(decode_image, await image.read())
@@ -1137,7 +1174,7 @@ async def detect(
 
         imgsz = max(32, int(round(imgsz / 32)) * 32)
         loop = asyncio.get_running_loop()
-        job = Job(img, label_to_target, conf, imgsz, time.perf_counter(), loop.create_future(), loop)
+        job = Job(img, label_to_target, conf, imgsz, time.perf_counter(), loop.create_future(), loop, max_results)
         detector.submit(job)
         try:
             out = await asyncio.wait_for(job.future, timeout=REQUEST_TIMEOUT + 2.0)
@@ -1158,6 +1195,7 @@ async def detect(
         record("detect", 200, "ok", t_start, ip, cid, **row)
         log.debug("detect %s found=%d %s", requested, len(out["detections"]), timing)
         return {
+            "mode": mode,
             "detections": out["detections"],
             "timing_ms": timing,
             "batch_size": out["batch_size"],

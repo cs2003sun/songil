@@ -3,6 +3,7 @@
 
 사용 예
   python test_detect.py photo.jpg --targets "mug,cup"
+  python test_detect.py photo.jpg --targets ""         # 전체 탐지 (배경 물체 제외, 최대 20개)
   python test_detect.py photo.jpg --url https://xxxx.trycloudflare.com --key 내키 --repeat 5
   python test_detect.py cup_crop.jpg --describe       # /describe (Gemini 중계) 테스트
   (--key 를 생략하면 환경변수 API_KEY 사용)
@@ -23,7 +24,7 @@ def main() -> None:
     p.add_argument("image", help="보낼 JPEG 파일 경로")
     p.add_argument("--url", default="http://127.0.0.1:8000", help="서버 주소 (기본 http://127.0.0.1:8000)")
     p.add_argument("--key", default=os.getenv("API_KEY", ""), help="X-API-Key (기본: 환경변수 API_KEY)")
-    p.add_argument("--targets", default="cup", help="찾을 물체, 쉼표로 여러 개 (기본 cup)")
+    p.add_argument("--targets", default="cup", help='찾을 물체, 쉼표로 여러 개 (기본 cup, ""이면 전체 탐지)')
     p.add_argument("--conf", type=float, default=0.25)
     p.add_argument("--imgsz", type=int, default=640)
     p.add_argument("--describe", action="store_true", help="/detect 대신 /describe 로 보내기")
@@ -73,7 +74,7 @@ def main() -> None:
             print(json.dumps(body, ensure_ascii=False, indent=2))
             continue
 
-        print(f"  device={body['device']} model={body['model']}")
+        print(f"  mode={body.get('mode')} device={body['device']} model={body['model']}")
         print(f"  서버 시간(ms): {body['timing_ms']}  배치 크기: {body.get('batch_size')}")
         print(f"  네트워크 등 서버 밖 시간: {rtt - body['timing_ms']['total']:.1f} ms")
         if not body["detections"]:

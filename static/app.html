@@ -317,7 +317,7 @@
 <body data-state="boot" data-listen="off">
 
   <!-- 시작 화면 (첫 터치로 카메라·마이크·소리 활성화) -->
-  <button id="startBtn" class="start" type="button" aria-label="시작. 카메라와 음성 안내를 켭니다">
+  <button id="startBtn" class="start" type="button" aria-label="시작. 카메라와 음성 안내를 켜요">
     <span class="start-word" id="startWord" aria-hidden="true">시작</span>
     <span class="start-note" id="startNote" aria-hidden="true">누르면 카메라와 음성 안내가 켜져요</span>
     <span class="start-warn" id="startWarn" aria-hidden="true" hidden></span>
@@ -338,12 +338,12 @@
         <canvas id="overlay" aria-hidden="true"></canvas>
       </div>
       <!-- 화면 대부분을 차지하는 말하기 버튼 (TalkBack: 두 번 탭, 일반: 한 번 탭 → 같은 click) -->
-      <button id="talkBtn" class="talk" type="button" aria-label="말하기. 찾을 물건을 말씀하세요">
+      <button id="talkBtn" class="talk" type="button" aria-label="말하기. 찾을 물건을 말씀해 주세요">
         <span class="talk-pill" id="talkPill" aria-hidden="true">말하기</span>
       </button>
     </div>
 
-    <button id="stopBtn" class="stop" type="button" aria-label="그만. 안내를 멈춥니다"><span aria-hidden="true">그만</span></button>
+    <button id="stopBtn" class="stop" type="button" aria-label="그만. 안내를 멈춰요"><span aria-hidden="true">그만</span></button>
 
     <!-- 주소에 #dev가 있을 때만 보이는 개발자 화면 -->
     <aside class="dev-panel" id="devPanel" hidden aria-label="개발자 화면">
@@ -361,6 +361,10 @@
         <div class="stat"><div class="stat-label">전체 왕복</div><div class="stat-value" id="totalVal">–</div></div>
         <div class="stat"><div class="stat-label">요청 간격</div><div class="stat-value" id="intervalVal">–</div></div>
         <div class="stat"><div class="stat-label">서버 장치</div><div class="stat-value" id="deviceVal">–</div></div>
+        <!-- 마지막 음성: 출처(파일/tts/브라우저), 재생 지연(차례가 온 뒤 소리가 나기까지) -->
+        <div class="stat"><div class="stat-label">음성 출처</div><div class="stat-value" id="voiceSrcVal">–</div></div>
+        <div class="stat"><div class="stat-label">재생 지연</div><div class="stat-value" id="voiceDelayVal">–</div></div>
+        <div class="stat"><div class="stat-label">녹음 파일</div><div class="stat-value" id="clipVal">–</div></div>
       </div>
       <div class="timing" id="timingDetail"></div>
 
@@ -411,6 +415,10 @@
         <ol class="log" id="speechLog"></ol>
       </details>
       <details class="dev-box" open>
+        <summary>음성 출력 기록 (출처 · 재생 지연)</summary>
+        <ol class="log" id="voiceLog"></ol>
+      </details>
+      <details class="dev-box" open>
         <summary>문장 해석 기록 (/parse)</summary>
         <ol class="log" id="parseLog"></ol>
       </details>
@@ -450,8 +458,8 @@ const GUIDE_CONFIG = {
   centerHoldMs: 250,        // 가운데에 이 시간 이상 머물러야 "정면에 있어요"
 
   // ---- 거리 구간 (박스 너비 / 화면 너비). 정확한 미터는 말하지 않음 ----
-  distNearRatio: 0.35,      // 이상: "팔 닿는 거리예요"
-  distMidRatio: 0.15,       // 이상: "한두 걸음 앞이에요", 미만: "조금 멀리 있어요"
+  distNearRatio: 0.35,      // 이상: "팔이 닿는 거리예요" (dist_near)
+  distMidRatio: 0.15,       // 이상: "한두 걸음 앞이에요" (dist_mid), 미만: "조금 멀리 있어요" (dist_far)
 
   // ---- 탐색 ----
   searchTickMs: 5000,       // "찾는 중" 효과음 간격
@@ -459,7 +467,7 @@ const GUIDE_CONFIG = {
   searchTimeoutMs: 30000,   // "주변에서 찾지 못했어요" 후 대기로
 
   // ---- 물체를 놓쳤을 때 (발견·손 안내 단계) ----
-  lostTurnMs: 2000,         // 이 시간 이상 안 보이면 "폰을 천천히 ○쪽으로 돌려주세요"
+  lostTurnMs: 2000,         // 이 시간 이상 안 보이면 "폰을 천천히 ○쪽으로 돌려 주세요" (lost_turn_left/right)
   lostTurnRepeatMs: 6000,   // 위 안내를 다시 말하는 간격
   lostResearchMs: 10000,    // 이 시간 이상 안 보이면 탐색 단계로 복귀
 
@@ -549,6 +557,107 @@ const OBJECT_DICT = {
 };
 
 // =====================================================================
+// 안내 문장: 이 페이지와 같은 폴더의 phrases.json에서 시작할 때 불러옴 (문장은 그 파일 한 곳에서만 관리)
+// { id: [표현1, 표현2, ...] } 녹음 파일이 없을 때 /tts로 읽을 문장이자 화면 자막
+// phrases.json을 못 불러오면 아래 DEFAULT_PHRASES(핵심 안내만, 표현 하나씩)로 동작
+// 녹음 파일: static/audio/{id}_{번호}.mp3 (번호는 1부터. 예: static/audio/move_right_2.mp3)
+// static/audio/manifest.json { "id": 녹음 파일 개수 } → 개수가 여러 개면 말할 때마다 차례로 번갈아 사용
+// 물건 템플릿: find_{물건}, found_{물건} (물건 = 사전 영어 이름의 공백을 _로. 예: water bottle → water_bottle)
+// 목록에 없는 문장(VLM 설명, 사전에 없는 물건 이름)만 서버 /tts로 실시간 생성
+// =====================================================================
+const PHRASE_AUDIO_BASE = "static/audio/";   // 이 페이지 기준 녹음 파일 폴더
+const PHRASE_AUDIO_EXT = ".mp3";
+const MANIFEST_URL = `${PHRASE_AUDIO_BASE}manifest.json`;
+const PHRASES_URL = "phrases.json";
+const PHRASES_TIMEOUT_MS = 5000;
+const DEFAULT_PHRASES = {
+  ready: ["준비됐어요. 말하기 버튼을 누르고, 찾을 물건을 말씀해 주세요."],
+  not_ready: ["아직 준비 중이에요. 잠시 후에 다시 말씀해 주세요."],
+  unknown_object: ["아직 모르는 물건이에요. 다른 이름으로 말씀해 주세요."],
+  wait: ["잠시만요."],
+  stopped: ["안내를 멈췄어요."],
+  no_stt: ["이 브라우저에서는 음성 인식을 쓸 수 없어요. 크롬으로 열어 주세요."],
+  stt_no_speech: ["말소리가 들리지 않았어요. 말하기 버튼을 누르고, 다시 말씀해 주세요."],
+  stt_error: ["음성 인식에 문제가 생겼어요. 말하기 버튼을 다시 눌러 주세요."],
+  start_failed: ["시작하지 못했어요. 시작 버튼을 다시 눌러 주세요."],
+  fatal_hand: ["손 인식이 멈췄어요. 시작 버튼을 다시 눌러 주세요."],
+  fatal_frame: ["문제가 생겨서 안내가 멈췄어요. 시작 버튼을 다시 눌러 주세요."],
+  turn_phone: ["폰을 천천히 돌려 주세요."],
+  search_hint: ["아직 못 찾았어요. 계속 천천히 돌려 주세요."],
+  search_timeout: ["이 주변에서는 찾지 못했어요. 다시 찾으려면 말하기 버튼을 눌러 주세요."],
+  found: ["멈추세요. 찾았어요."],
+  align_left: ["폰을 조금 왼쪽으로."],
+  align_right: ["폰을 조금 오른쪽으로."],
+  pos_center: ["정면에 있어요."],
+  dist_near: ["팔이 닿는 거리예요."],
+  dist_mid: ["한두 걸음 앞이에요."],
+  dist_far: ["조금 멀리 있어요."],
+  reach_out: ["손을 천천히 뻗어 보세요."],
+  move_left: ["왼쪽으로."],
+  move_right: ["오른쪽으로."],
+  move_forward: ["앞으로."],
+  move_back: ["몸 쪽으로."],
+  hand_lost: ["손이 화면에서 벗어났어요."],
+  reached: ["좋아요, 바로 거기예요. 잡아 보세요."],
+  grabbed: ["잡으셨어요! 잘하셨어요."],
+  lost_turn_left: ["폰을 천천히 왼쪽으로 돌려 주세요."],
+  lost_turn_right: ["폰을 천천히 오른쪽으로 돌려 주세요."],
+  lost_research: ["물건이 화면에서 사라졌어요. 폰을 천천히 돌려 주세요."],
+};
+
+// 지금 쓰는 문장 목록: 처음에는 기본 문장, phrases.json을 불러오면 그 내용 (기본 문장 위에 덮어씀)
+let PHRASES = { ...DEFAULT_PHRASES };
+let phrasesPromise = null;
+let phrasesFrom = "기본 문장"; // #dev 표시용
+
+// phrases.json 불러오기 → { ok: true, count } 또는 { ok: false, error }. 실패하면 다음 시작 때 다시 시도
+function loadPhrases() {
+  if (phrasesPromise) return phrasesPromise;
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), PHRASES_TIMEOUT_MS);
+  phrasesPromise = fetch(PHRASES_URL, { cache: "no-cache", signal: ac.signal })
+    .then((res) => {
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return res.json();
+    })
+    .then((data) => {
+      const loaded = {};
+      for (const [id, list] of Object.entries(data && typeof data === "object" && !Array.isArray(data) ? data : {})) {
+        const vs = (Array.isArray(list) ? list : [list]).map((v) => (typeof v === "string" ? v.trim() : "")).filter(Boolean);
+        if (vs.length) loaded[id] = vs;
+      }
+      const count = Object.keys(loaded).length;
+      if (!count) throw new Error("문장이 하나도 없음");
+      PHRASES = { ...DEFAULT_PHRASES, ...loaded };
+      phrasesFrom = "phrases.json";
+      console.log(`phrases.json: 문장 id ${count}개`);
+      return { ok: true, count };
+    })
+    .catch((err) => {
+      const error = ac.signal.aborted ? `시간 초과 (${PHRASES_TIMEOUT_MS / 1000}초)` : errorText(err);
+      console.warn("phrases.json을 불러오지 못해 기본 문장으로 동작", error);
+      phrasesPromise = null;
+      return { ok: false, error };
+    })
+    .finally(() => clearTimeout(timer));
+  return phrasesPromise;
+}
+
+// 문장이 없는 id → 대신 말할 기본 id (phrases.json을 못 불러왔을 때)
+function fallbackPhraseId(id) {
+  if (id.startsWith("start_")) return "start_failed";
+  if (id.startsWith("stt_") || id === "mic_denied") return "stt_error";
+  return null;
+}
+
+// 물건 템플릿 id (예: objectPhraseId("find", "water bottle") → "find_water_bottle"). 목록에 없으면 null
+const objectSlug = (en) => String(en || "").toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+function objectPhraseId(kind, en) {
+  const id = `${kind}_${objectSlug(en)}`;
+  return PHRASES[id] ? id : null;
+}
+
+// =====================================================================
 // 서버·모델 설정값 (index.html과 동일)
 // =====================================================================
 const MP_VERSION = "0.10.14"; // @mediapipe/tasks-vision 버전 고정
@@ -588,6 +697,18 @@ const DESCRIBE_JPEG_QUALITY = 0.85;
 const DESCRIBE_TIMEOUT_MS = 20000;
 const DESCRIBE_RETRY_MS = 3000;       // 429·503이면 이 시간 뒤 한 번 더 시도
 const DESCRIBE_MAX_TRIES = 2;
+
+// 음성 출력 순서
+//   고정 문장(speakId): 녹음 파일 → 파일이 없으면 phrases.json 문장을 /tts로 → 실패하면 브라우저 음성
+//   바뀌는 문장(물건 이름, VLM 설명): /tts → 실패·429·3초 초과면 브라우저 음성(SpeechSynthesis)
+// POST /tts 요청: JSON {"text": "..."} / 응답: 소리 파일(audio/mpeg 등) 또는 JSON {"audio_base64": "..."}
+const CLIP_WAIT_MS = 1500;          // 미리 받기가 덜 끝난 녹음 파일을 이 시간까지 기다리고, 늦으면 브라우저 음성
+const CLIP_PRELOAD_PARALLEL = 4;    // 녹음 파일을 미리 받을 때 동시에 몇 개씩 받을지
+const MANIFEST_TIMEOUT_MS = 5000;   // manifest.json 제한 시간 (못 읽으면 고정 문장도 /tts로)
+const TTS_TEXT_FIELD = "text";      // /tts JSON 필드 이름
+const TTS_TIMEOUT_MS = 3000;        // /tts 제한 시간
+const TTS_RATE_LIMIT_PAUSE_MS = 10000; // 429를 받으면 이 시간 동안은 /tts를 부르지 않고 바로 브라우저 음성
+const TTS_CACHE_MAX = 20;           // 실시간 생성 소리를 몇 개까지 기억할지 ("어떻게 잡아" 반복 대비)
 
 // 문장 해석 요청 (POST /parse): 단어 판별에 실패했거나 사전에 없는 물건일 때만
 const PARSE_TIMEOUT_MS = 3000;
@@ -644,6 +765,7 @@ const els = {
   captureVal: $("captureVal"), encodeVal: $("encodeVal"), bytesVal: $("bytesVal"), sizeLabel: $("sizeLabel"),
   totalVal: $("totalVal"), encodeLabel: $("encodeLabel"),
   timingDetail: $("timingDetail"), output: $("output"), describeOut: $("describeOut"),
+  voiceSrcVal: $("voiceSrcVal"), voiceDelayVal: $("voiceDelayVal"), clipVal: $("clipVal"), voiceLog: $("voiceLog"),
   qrModal: $("qrModal"), qrCanvas: $("qrCanvas"), qrUrl: $("qrUrl"), qrWarn: $("qrWarn"), qrCloseBtn: $("qrCloseBtn"),
 };
 const ctx = els.canvas.getContext("2d");
@@ -789,6 +911,10 @@ window.addEventListener("unhandledrejection", (e) => showError(e.reason));
 const sound = (() => {
   let ac = null;
   let master = null;
+  let speechOut = null; // 음성 출력 (효과음과 따로 연결해서 음성이 나올 때 줄어들지 않음)
+  let cueOut = null;    // 듣기 시작·끝 신호음 (녹음 중 음소거와 상관없이 남)
+  let ducked = false;   // 음성 재생 중: 비프음 작게
+  let muted = false;    // 녹음(듣기) 중: 효과음·음성 모두 끔
 
   // 첫 터치 안에서 호출해야 소리가 남 (모바일 정책)
   function unlock() {
@@ -799,18 +925,39 @@ const sound = (() => {
       master = ac.createGain();
       master.gain.value = 1;
       master.connect(ac.destination);
+      speechOut = ac.createGain();
+      speechOut.gain.value = 1;
+      speechOut.connect(ac.destination);
+      cueOut = ac.createGain();
+      cueOut.gain.value = 1;
+      cueOut.connect(ac.destination);
+      applyGain();
     }
     if (ac.state !== "running") ac.resume().catch(() => {});
   }
 
-  // 음성 출력 중에는 효과음을 작게
-  function setDuck(on) {
+  function applyGain() {
     if (!ac) return;
-    master.gain.setTargetAtTime(on ? C.duckVolume : 1, ac.currentTime, 0.03);
+    const t = ac.currentTime;
+    master.gain.cancelScheduledValues(t);
+    speechOut.gain.cancelScheduledValues(t);
+    master.gain.setTargetAtTime(muted ? 0 : ducked ? C.duckVolume : 1, t, muted ? 0.005 : 0.03);
+    speechOut.gain.setTargetAtTime(muted ? 0 : 1, t, 0.005);
+  }
+  // 음성 재생 중에는 비프음 등 효과음을 작게
+  function setDuck(on) {
+    ducked = on;
+    applyGain();
+  }
+  // 녹음(듣기) 중에는 신호음을 빼고 모든 소리를 끔
+  function setMute(on) {
+    muted = on;
+    applyGain();
   }
 
   // 짧은 음 하나. pan: -1(왼쪽) ~ 1(오른쪽)
-  function tone({ freq, dur = 0.06, type = "sine", gain = 0.3, pan = 0, at = 0, endFreq = 0 }) {
+  // bus: "fx"(효과음, 줄이기·끄기 적용) / "cue"(듣기 신호음)
+  function tone({ freq, dur = 0.06, type = "sine", gain = 0.3, pan = 0, at = 0, endFreq = 0, bus = "fx" }) {
     if (!ac) return;
     if (ac.state !== "running") { ac.resume().catch(() => {}); return; }
     const t0 = ac.currentTime + 0.005 + at;
@@ -832,22 +979,52 @@ const sound = (() => {
       g.connect(p);
       out = p;
     }
-    out.connect(master);
+    out.connect(bus === "cue" ? cueOut : master);
     osc.start(t0);
     osc.stop(t0 + dur + 0.03);
+  }
+
+  // 압축된 소리(mp3 등) → AudioBuffer. 실패하면 null. 원본은 캐시에 남기려고 복사본을 넘김
+  function decode(bytes) {
+    if (!ac || !bytes) return Promise.resolve(null);
+    return new Promise((resolve) => {
+      try {
+        const p = ac.decodeAudioData(bytes.slice(0), resolve, () => resolve(null));
+        if (p && typeof p.then === "function") p.then(resolve, () => resolve(null));
+      } catch (_) {
+        resolve(null);
+      }
+    });
+  }
+
+  // 음성 재생. 끝나면 onEnd(). 재생할 수 없으면 null
+  function playSpeech(buffer, onEnd) {
+    if (!ac || !speechOut || !buffer) return null;
+    if (ac.state !== "running") { ac.resume().catch(() => {}); return null; }
+    const src = ac.createBufferSource();
+    src.buffer = buffer;
+    src.connect(speechOut);
+    let ended = false;
+    src.onended = () => { if (ended) return; ended = true; onEnd(); };
+    src.start();
+    return { stop() { if (ended) return; ended = true; try { src.stop(); } catch (_) { /* 무시 */ } } };
   }
 
   return {
     unlock,
     setDuck,
+    setMute,
+    decode,
+    playSpeech,
+    get canPlay() { return Boolean(ac && speechOut); },
     get ready() { return Boolean(ac && ac.state === "running"); },
     // 손 안내 비프 (손을 옮겨야 할 쪽에서 소리가 남)
     beep(pan) { tone({ freq: C.beepFreq, dur: C.beepDurMs / 1000, type: "triangle", gain: C.beepVolume, pan }); },
     // 목표 범위에 들어옴: 높은 음 한 번
     hit() { tone({ freq: C.hitFreq, dur: 0.18, gain: 0.4 }); },
     // 듣기 시작: 올라가는 두 음 / 듣기 끝: 내려가는 두 음
-    listenStart() { tone({ freq: 660, dur: 0.07, gain: 0.3 }); tone({ freq: 990, dur: 0.09, gain: 0.3, at: 0.08 }); },
-    listenEnd() { tone({ freq: 990, dur: 0.07, gain: 0.25 }); tone({ freq: 590, dur: 0.1, gain: 0.25, at: 0.08 }); },
+    listenStart() { tone({ freq: 660, dur: 0.07, gain: 0.3, bus: "cue" }); tone({ freq: 990, dur: 0.09, gain: 0.3, at: 0.08, bus: "cue" }); },
+    listenEnd() { tone({ freq: 990, dur: 0.07, gain: 0.25, bus: "cue" }); tone({ freq: 590, dur: 0.1, gain: 0.25, at: 0.08, bus: "cue" }); },
     // 찾는 중: 낮고 짧은 똑똑
     searching() { tone({ freq: 520, dur: 0.04, gain: 0.22 }); tone({ freq: 520, dur: 0.04, gain: 0.22, at: 0.13 }); },
     // 잡기 성공: 올라가는 세 음
@@ -915,19 +1092,22 @@ function chooseIntent(alts) {
 
 // =====================================================================
 // 음성 기능 (출력 대기열 + 우선순위, 음성 인식) - 하나의 객체
-// voice.speak(text, priority, opts), voice.stopAll(), voice.onIntent(callback)
+// voice.speakId(id, priority, opts)   미리 녹음한 문장 (표현 여러 개면 번갈아)
+// voice.speakParts([...], priority)  여러 조각을 이어서 한 번에 (id 또는 { text })
+// voice.speak(text, priority, opts)  목록에 없는 문장 (서버 /tts 실시간 생성)
+// voice.stopAll(), voice.onIntent(callback)
 // =====================================================================
-const NO_STT_MSG = "이 브라우저는 음성 인식을 지원하지 않아요. 크롬 사용을 권장해요";
-const REC_ERRORS = {
-  "no-speech": "말소리가 들리지 않았어요. 말하기 버튼을 누르고 다시 말씀해 주세요",
-  "audio-capture": "마이크를 사용할 수 없어요. 다른 앱이 마이크를 쓰고 있는지 확인해 주세요",
-  "not-allowed": "마이크 권한이 없어요. 브라우저 설정에서 마이크를 허용해 주세요",
-  "service-not-allowed": "이 브라우저에서는 음성 인식을 쓸 수 없어요. 크롬 사용을 권장해요",
-  "network": "인터넷 연결이 불안정해서 말씀을 알아듣지 못했어요. 다시 말씀해 주세요",
-  "language-not-supported": "한국어 음성 인식을 지원하지 않아요. 크롬 사용을 권장해요",
-  "aborted": "음성 인식이 중간에 끊겼어요. 말하기 버튼을 다시 눌러 주세요",
-  "start-failed": "음성 인식을 시작하지 못했어요. 말하기 버튼을 다시 눌러 주세요",
-  "start-timeout": "음성 인식을 시작하지 못했어요. 말하기 버튼을 다시 눌러 주세요",
+// 음성 인식 오류 코드 → 문장 id
+const REC_ERROR_IDS = {
+  "no-speech": "stt_no_speech",
+  "audio-capture": "stt_audio_capture",
+  "not-allowed": "stt_not_allowed",
+  "service-not-allowed": "no_stt",
+  "network": "stt_network",
+  "language-not-supported": "stt_language",
+  "aborted": "stt_aborted",
+  "start-failed": "stt_start_failed",
+  "start-timeout": "stt_start_failed",
 };
 
 const voice = (() => {
@@ -935,16 +1115,28 @@ const voice = (() => {
   const Rec = window.SpeechRecognition || window.webkitSpeechRecognition || null;
 
   // ---- 출력 ----
+  // 말할 것 하나 = item { parts, text, priority, group, keep, expiresAt, createdAt }
+  // part = { id(목록 id, 실시간이면 null), variant(표현 번호), text, audio }
+  //   audio = Promise<{ bytes?, source: "file" | "tts" | "browser", note }> - 말하기로 한 순간 받기 시작
+  // part를 차례로: bytes가 있으면 그 소리, 없으면 브라우저 음성으로 text를 읽음
   let koVoice = null;
   let unlocked = false;
   let seq = 0;
   const queue = [];        // 우선순위 높은 순, 같으면 들어온 순
-  let current = null;      // { item, utter, timer }
+  let current = null;      // { item, index, timer, stop }
   let holdOutput = false;  // 듣는 동안은 말하지 않고 대기열에 보관
   let pumpTimer = null;
   let lastCancelAt = -Infinity;
   let speakingNow = false;
   let intentCb = null;
+  const turns = new Map();     // id → 마지막에 쓴 표현 번호 (번갈아 쓰기)
+  const clipCache = new Map(); // 녹음 파일 주소 → Promise<ArrayBuffer|null> (압축된 채로 보관)
+  const ttsCache = new Map();  // 실시간 문장 → Promise<{ bytes, ms } | { error }> (성공한 최근 것만)
+  let manifest = null;         // { id: 녹음 파일 개수 } (읽기 전·실패하면 null)
+  let manifestPromise = null;
+  let ttsPausedUntil = 0;      // 429를 받으면 잠시 /tts를 쉼
+  const clipStats = { total: 0, loaded: new Set(), failed: new Set(), error: "" };
+  const TIMEOUT = Symbol("timeout");
 
   // ---- 듣기 ----
   let rec = null;
@@ -956,7 +1148,7 @@ const voice = (() => {
   let lastError = "";
   let cancelled = false;
 
-  // 한국어 음성 자동 선택 (ko-KR + 기기 내장 음성 우선)
+  // 한국어 음성 자동 선택 (ko-KR + 기기 내장 음성 우선) - 녹음·/tts가 없을 때 쓰는 기기 음성
   function pickVoice() {
     if (!synth) return;
     const ko = synth.getVoices().filter((v) => /^ko/i.test(v.lang || ""));
@@ -992,12 +1184,9 @@ const voice = (() => {
     try { synth && synth.cancel(); } catch (_) { /* 무시 */ }
   }
 
-  // 크롬은 cancel() 직후 바로 speak()하면 말이 씹히는 경우가 있어 잠깐 기다림
   function schedulePump(delay = 0) {
-    const sinceCancel = performance.now() - lastCancelAt;
-    const wait = Math.max(delay, sinceCancel < 120 ? 120 - sinceCancel : 0);
     if (pumpTimer) clearTimeout(pumpTimer);
-    pumpTimer = setTimeout(pump, wait);
+    pumpTimer = setTimeout(pump, delay);
   }
 
   function enqueue(item, front = false) {
@@ -1012,82 +1201,289 @@ const voice = (() => {
     for (let i = queue.length - 1; i >= 0; i--) if (pred(queue[i])) queue.splice(i, 1);
   }
 
+  // ---- 소리 준비 ----
+  function clipUrl(id, i) { return `${PHRASE_AUDIO_BASE}${id}_${i + 1}${PHRASE_AUDIO_EXT}`; }
+
+  function reportClipStats() {
+    onVoiceStats({ total: clipStats.total, loaded: clipStats.loaded.size, failed: clipStats.failed.size, error: clipStats.error });
+  }
+
+  // manifest.json을 읽고, 들어 있는 녹음 파일을 모두 미리 받음 (시작 버튼을 누를 때)
+  function loadManifest() {
+    if (manifestPromise) return manifestPromise;
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), MANIFEST_TIMEOUT_MS);
+    manifestPromise = fetch(MANIFEST_URL, { cache: "no-cache", signal: ac.signal })
+      .then((res) => {
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        return res.json();
+      })
+      .then((m) => {
+        const clean = {};
+        for (const [id, n] of Object.entries(m && typeof m === "object" ? m : {})) {
+          const k = Math.floor(Number(n));
+          if (k > 0) clean[id] = k;
+        }
+        manifest = clean;
+        clipStats.error = "";
+        preloadAll();
+        return manifest;
+      })
+      .catch((err) => {
+        console.warn("manifest.json을 읽지 못함 → 고정 문장도 /tts로 말함", errorText(err));
+        clipStats.error = `manifest 없음 (${errorText(err)})`;
+        reportClipStats();
+        manifestPromise = null; // 다음에 시작 버튼을 누르면 다시 시도
+        return {};
+      })
+      .finally(() => clearTimeout(timer));
+    return manifestPromise;
+  }
+
+  function preloadAll() {
+    const urls = [];
+    for (const [id, n] of Object.entries(manifest)) for (let i = 0; i < n; i++) urls.push(clipUrl(id, i));
+    clipStats.total = urls.length;
+    reportClipStats();
+    let k = 0;
+    const next = () => (k < urls.length ? loadClip(urls[k++]).then(next) : null);
+    for (let n = 0; n < CLIP_PRELOAD_PARALLEL; n++) next();
+  }
+
+  // 녹음 파일 받기 (받은 것은 기억. 실패하면 다음에 다시 시도)
+  function loadClip(url) {
+    let p = clipCache.get(url);
+    if (!p) {
+      p = fetch(url)
+        .then((res) => {
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          return res.arrayBuffer();
+        })
+        .then((bytes) => {
+          clipStats.loaded.add(url);
+          clipStats.failed.delete(url);
+          reportClipStats();
+          return bytes;
+        })
+        .catch((err) => {
+          console.warn(`녹음 파일을 받지 못함: ${url}`, errorText(err));
+          clipStats.failed.add(url);
+          reportClipStats();
+          clipCache.delete(url);
+          return null;
+        });
+      clipCache.set(url, p);
+    }
+    return p;
+  }
+
+  // 실시간 생성 (POST /tts, 3초 제한) → { bytes, ms, cached? } 또는 { error }
+  function loadTts(text) {
+    if (!cfg.server) return Promise.resolve({ error: "서버 주소 없음" });
+    const cached = ttsCache.get(text);
+    if (cached) {
+      ttsCache.delete(text);
+      ttsCache.set(text, cached); // 최근에 쓴 것으로 옮김
+      return cached.then((r) => (r.bytes ? { ...r, cached: true } : r));
+    }
+    if (performance.now() < ttsPausedUntil) return Promise.resolve({ error: "429 뒤 잠시 쉬는 중" });
+    const t0 = performance.now();
+    const p = fetchTts(text)
+      .then((bytes) => ({ bytes, ms: performance.now() - t0 }))
+      .catch((err) => {
+        ttsCache.delete(text);
+        if (err.status === 429) ttsPausedUntil = performance.now() + TTS_RATE_LIMIT_PAUSE_MS;
+        console.warn("/tts 실패 → 브라우저 음성", errorText(err));
+        return { error: errorText(err) };
+      });
+    ttsCache.set(text, p);
+    while (ttsCache.size > TTS_CACHE_MAX) ttsCache.delete(ttsCache.keys().next().value);
+    return p;
+  }
+
+  // promise가 ms 안에 끝나면 그 값, 아니면 onTimeout
+  function within(promise, ms, onTimeout = null) {
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => resolve(onTimeout), ms);
+      promise.then(
+        (v) => { clearTimeout(timer); resolve(v); },
+        () => { clearTimeout(timer); resolve(null); }
+      );
+    });
+  }
+
+  // 바뀌는 문장 (또는 녹음 파일이 없는 고정 문장): /tts → 실패하면 브라우저
+  async function resolveLive(text, why = "") {
+    if (!sound.canPlay) return { source: "browser", note: "Web Audio 없음" };
+    const r = await loadTts(text);
+    const join = (...a) => a.filter(Boolean).join(", ");
+    if (r.bytes) return { bytes: r.bytes, source: "tts", note: join(why, r.cached ? "캐시" : `생성 ${Math.round(r.ms)}ms`) };
+    return { source: "browser", note: join(why, `tts 실패: ${r.error}`) };
+  }
+
+  // 고정 문장: 녹음 파일 → 없으면 /tts
+  async function resolveFixed(id, i, text) {
+    if (!sound.canPlay) return { source: "browser", note: "Web Audio 없음" };
+    const m = manifest || (manifestPromise ? await manifestPromise : {});
+    if ((m[id] || 0) > i) {
+      const bytes = await within(loadClip(clipUrl(id, i)), CLIP_WAIT_MS, TIMEOUT);
+      if (bytes === TIMEOUT) return { source: "browser", note: "녹음 파일 늦음" };
+      if (bytes) return { bytes, source: "file" };
+    }
+    if (!text) return { source: "browser", note: "문장 없음" };
+    return resolveLive(text, "녹음 파일 없음");
+  }
+
+  // 고정 문장 조각. 녹음 파일이 여러 개면(manifest) 차례로 번갈아 고름
+  function phrasePart(id) {
+    if (!PHRASES[id] && !(manifest && manifest[id])) {
+      const alt = fallbackPhraseId(id);
+      if (alt && alt !== id && PHRASES[alt]) return phrasePart(alt);
+    }
+    const list = PHRASES[id] || [];
+    const files = manifest ? manifest[id] || 0 : 0;
+    const n = files || list.length;
+    if (!n) { console.warn(`문장 목록에 없는 id: ${id}`); return null; }
+    const i = ((turns.get(id) ?? -1) + 1) % n;
+    turns.set(id, i);
+    const text = list.length ? list[i % list.length] : "";
+    return { id, variant: i + 1, text, audio: resolveFixed(id, i, text) };
+  }
+
+  // 바뀌는 문장 조각 (실시간 생성). 받는 건 지금 바로 시작해서 차례가 올 때쯤 준비되게 함
+  function livePart(text) {
+    const t = toSpeech(text);
+    if (!t) return null;
+    return { id: null, variant: 0, text: t, audio: resolveLive(t) };
+  }
+
+  // ---- 재생 ----
   // 지금 말하는 것을 끊음. keep 표시가 있으면 대기열 맨 앞에 다시 넣음
   function interruptCurrent() {
     const c = current;
     if (!c) return;
     current = null;
     clearTimeout(c.timer);
+    if (c.stop) c.stop();
     if (c.item.keep) enqueue(c.item, true);
-    cancelSynth();
   }
 
   function pump() {
     pumpTimer = null;
-    if (current || holdOutput || !synth) return;
+    if (current || holdOutput) return;
     const now = performance.now();
     // 너무 오래 기다린 안내(손 교정 등)는 버림
     while (queue.length && queue[0].expiresAt < now) queue.shift();
     const item = queue.shift();
     if (!item) { setSpeaking(false); return; }
-
-    const u = new SpeechSynthesisUtterance(item.text);
-    u.lang = "ko-KR";
-    if (koVoice) u.voice = koVoice;
-    u.rate = C.speechRate;
-    const record = { item, utter: u, timer: 0 };
+    const record = { item, index: 0, timer: 0, stop: null };
     current = record;
-    const done = () => {
-      if (current !== record) return;
-      clearTimeout(record.timer);
-      current = null;
-      schedulePump(0);
-    };
-    u.onend = done;
-    u.onerror = (e) => {
-      if (e && e.error !== "interrupted" && e.error !== "canceled") console.warn("음성 출력 오류", e.error);
-      done();
-    };
-    // 크롬에서 끝 이벤트가 오지 않는 경우 대비 (글자 수로 넉넉하게)
-    record.timer = setTimeout(() => {
-      if (current !== record) return;
-      console.warn("음성 출력이 끝나지 않아 다음으로 넘어갑니다:", item.text);
-      current = null;
-      cancelSynth();
-      schedulePump(0);
-    }, 4000 + item.text.length * 300);
-
-    setSpeaking(true);
     onVoiceCaption(item.text);
-    try {
-      if (synth.paused) synth.resume();
-      synth.speak(u);
-    } catch (err) {
-      console.warn("음성 출력 실패", err);
-      done();
-    }
+    playNext(record);
   }
 
-  // text: 말할 문장, priority: PRIORITY.SAFETY / GUIDE / INFO
+  // 조각 하나 재생 → 끝나면 다음 조각 → 다 끝나면 대기열의 다음 말
+  async function playNext(record) {
+    if (current !== record) return;
+    clearTimeout(record.timer);
+    record.stop = null;
+    setSpeaking(false); // 소리를 기다리는 동안은 비프음을 원래 크기로
+    const part = record.item.parts[record.index++];
+    if (!part) {
+      current = null;
+      schedulePump(0);
+      return;
+    }
+    const turnAt = performance.now();
+    const queueMs = record.index === 1 ? turnAt - record.item.createdAt : 0;
+    const report = (source, note) => onVoicePlay({
+      source, id: part.id, variant: part.variant, text: part.text, note,
+      delayMs: performance.now() - turnAt, queueMs, priority: record.item.priority,
+    });
+    const next = () => playNext(record);
+    const r = (await part.audio) || { source: "browser", note: "" };
+    if (current !== record) return;
+    const buffer = r.bytes ? await sound.decode(r.bytes) : null;
+    if (current !== record) return;
+    if (buffer) {
+      const h = sound.playSpeech(buffer, next);
+      if (h) {
+        setSpeaking(true);
+        report(r.source, r.note);
+        record.stop = h.stop;
+        // 끝 이벤트가 오지 않는 경우 대비
+        record.timer = setTimeout(() => { if (current === record) { h.stop(); next(); } }, buffer.duration * 1000 + 1500);
+        return;
+      }
+    }
+    const why = r.bytes ? (buffer ? "오디오 재생 불가" : "소리 파일 해석 실패") : r.note;
+    playSynth(record, part.text, next, () => { setSpeaking(true); report("browser", why); });
+  }
+
+  // 브라우저 음성 (SpeechSynthesis): 녹음·/tts가 없거나 실패했을 때. onStart: 소리가 나기 시작할 때
+  function playSynth(record, text, next, onStart) {
+    if (!synth || !text) { onStart(); next(); return; }
+    const go = () => {
+      if (current !== record) return;
+      const u = new SpeechSynthesisUtterance(text);
+      u.lang = "ko-KR";
+      if (koVoice) u.voice = koVoice;
+      u.rate = C.speechRate;
+      let started = false;
+      let ended = false;
+      const markStart = () => { if (started) return; started = true; onStart(); };
+      const end = () => { if (ended) return; ended = true; markStart(); next(); };
+      u.onstart = markStart;
+      u.onend = end;
+      u.onerror = (e) => {
+        if (e && e.error !== "interrupted" && e.error !== "canceled") console.warn("음성 출력 오류", e.error);
+        end();
+      };
+      record.stop = () => { ended = true; cancelSynth(); };
+      // 크롬에서 끝 이벤트가 오지 않는 경우 대비 (글자 수로 넉넉하게)
+      record.timer = setTimeout(() => {
+        if (ended) return;
+        console.warn("음성 출력이 끝나지 않아 다음으로 넘어갑니다:", text);
+        ended = true;
+        cancelSynth();
+        next();
+      }, 4000 + text.length * 300);
+      try {
+        if (synth.paused) synth.resume();
+        synth.speak(u);
+      } catch (err) {
+        console.warn("음성 출력 실패", err);
+        end();
+      }
+    };
+    // 크롬은 cancel() 직후 바로 speak()하면 말이 씹히는 경우가 있어 잠깐 기다림
+    const wait = 120 - (performance.now() - lastCancelAt);
+    if (wait > 0) record.timer = setTimeout(go, wait);
+    else go();
+  }
+
+  // priority: PRIORITY.SAFETY / GUIDE / INFO
   // opts.group: 같은 group의 대기 중인 말은 새 말로 교체
   // opts.ttl: 대기열에서 이 시간(ms) 넘게 기다리면 버림
   // opts.interrupt: 같은 우선순위라도 지금 말하던 걸 끊음
   // opts.keep: 더 높은 우선순위에 끊기면 나중에 다시 말함
-  function speak(text, priority = PRIORITY.INFO, opts = {}) {
-    const t = toSpeech(text);
-    if (!t) return;
+  function say(parts, priority, opts) {
+    const list = parts.filter(Boolean);
+    if (!list.length) return;
     const now = performance.now();
     const item = {
-      id: ++seq, text: t, priority,
+      id: ++seq, parts: list, priority,
+      text: list.map((p) => p.text).join(" "),
       group: opts.group || null,
       keep: Boolean(opts.keep),
       expiresAt: opts.ttl ? now + opts.ttl : Infinity,
+      createdAt: now,
     };
-    console.log(`[음성 출력 p${priority}] ${t}`);
-    if (!synth) { onVoiceCaption(t); return; }
+    console.log(`[음성 출력 p${priority}] ${list.map((p) => `${p.id ? `[${p.id}]` : "[실시간]"} ${p.text}`).join(" + ")}`);
+    if (!synth && !sound.canPlay) { onVoiceCaption(item.text); return; }
     if (item.group) removeQueued((q) => q.group === item.group);
     enqueue(item);
-    // 우선순위가 높은 말이 오면 지금 말하던 걸 끊고 바로 말함
+    // 우선순위가 높은 말이 오면 지금 재생 중인 소리를 바로 멈추고 새 말을 재생
     if (current && !holdOutput) {
       const cp = current.item.priority;
       if (priority > cp || (opts.interrupt && priority >= cp)) interruptCurrent();
@@ -1095,10 +1491,25 @@ const voice = (() => {
     schedulePump(0);
   }
 
+  // 미리 녹음한 문장: speakId("move_right", PRIORITY.GUIDE)
+  function speakId(id, priority = PRIORITY.INFO, opts = {}) {
+    say([phrasePart(id)], priority, opts);
+  }
+  // 바뀌는 문장 (물건 이름, VLM 설명 등): 서버 /tts 실시간 생성
+  function speak(text, priority = PRIORITY.INFO, opts = {}) {
+    say([livePart(text)], priority, opts);
+  }
+  // 조각을 이어서 한 번에: ["pos_left", "dist_near"] 또는 [{ text: "실시간 문장" }, "turn_phone"]
+  function speakParts(list, priority = PRIORITY.INFO, opts = {}) {
+    say(list.map((p) => (typeof p === "string" ? phrasePart(p) : p && p.text ? livePart(p.text) : null)), priority, opts);
+  }
+
   // 말하던 것과 대기열을 모두 지움
   function stopSpeaking() {
     queue.length = 0;
-    if (current) { clearTimeout(current.timer); current = null; }
+    const c = current;
+    current = null;
+    if (c) { clearTimeout(c.timer); if (c.stop) c.stop(); }
     if (synth) cancelSynth();
     setSpeaking(false);
   }
@@ -1119,7 +1530,7 @@ const voice = (() => {
   function listen() {
     if (!Rec) {
       stopSpeaking();
-      speak(NO_STT_MSG, PRIORITY.GUIDE);
+      speakId("no_stt", PRIORITY.GUIDE);
       onVoiceError("이 브라우저는 음성 인식을 지원하지 않습니다. 크롬 사용 권장");
       return;
     }
@@ -1239,9 +1650,9 @@ const voice = (() => {
 
   // 인식 오류는 한국어로 풀어서 말하고 화면에도 표시
   function reportError(code) {
-    const msg = REC_ERRORS[code] || "음성 인식에 문제가 생겼어요. 말하기 버튼을 다시 눌러 주세요";
-    speak(msg, PRIORITY.GUIDE, { group: "reply" });
-    onVoiceError(`음성 인식 오류 (${code}): ${msg}`);
+    const id = REC_ERROR_IDS[code] || "stt_error";
+    speakId(id, PRIORITY.GUIDE, { group: "reply" });
+    onVoiceError(`음성 인식 오류 (${code}): ${(PHRASES[id] || PHRASES.stt_error || [""])[0]}`);
     onVoiceLog({ error: code });
   }
 
@@ -1254,6 +1665,9 @@ const voice = (() => {
 
   return {
     speak,
+    speakId,
+    speakParts,
+    loadManifest,
     // 모든 음성 기능 중지 (듣기 취소 + 출력·대기열 비우기)
     stopAll() { cancelListening(); stopSpeaking(); },
     onIntent(cb) { intentCb = cb; },
@@ -1271,9 +1685,68 @@ const voice = (() => {
   };
 })();
 
+// 앱 코드에서 쓰는 짧은 이름
+function speakId(id, priority, opts) { voice.speakId(id, priority, opts); }        // 미리 녹음한 문장
+function speakParts(parts, priority, opts) { voice.speakParts(parts, priority, opts); } // 조각 이어 말하기
+function speakLive(text, priority, opts) { voice.speak(text, priority, opts); }     // 실시간 생성
+
+// 서버 /tts: 문장 → 소리 바이트 (ArrayBuffer). 실패하면 err.status(HTTP 상태)를 붙여서 던짐
+async function fetchTts(text) {
+  const ac = new AbortController();
+  let timedOut = false;
+  const timer = setTimeout(() => { timedOut = true; ac.abort(); }, TTS_TIMEOUT_MS);
+  try {
+    const headers = { "Content-Type": "application/json", "X-Client-Id": CLIENT_ID };
+    if (cfg.key) headers["X-API-Key"] = cfg.key;
+    const res = await fetch(`${cfg.server}/tts`, {
+      method: "POST", headers, body: JSON.stringify({ [TTS_TEXT_FIELD]: text }), signal: ac.signal, cache: "no-store",
+    });
+    if (!res.ok) {
+      const err = new Error(`HTTP ${res.status}`);
+      err.status = res.status;
+      throw err;
+    }
+    if (/json/i.test(res.headers.get("content-type") || "")) {
+      const body = await res.json();
+      const b64 = body && (body.audio_base64 || body.audio);
+      if (typeof b64 !== "string" || !b64) throw new Error("응답에 audio_base64가 없음");
+      const bin = atob(b64.replace(/^data:[^,]*,/, ""));
+      const bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      return bytes.buffer;
+    }
+    return await res.arrayBuffer();
+  } catch (err) {
+    if (timedOut) throw new Error(`시간 초과 (${TTS_TIMEOUT_MS / 1000}초)`);
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// #dev: 음성 출처·재생 지연 표시
+const VOICE_SOURCE_LABEL = { file: "파일", tts: "tts", browser: "브라우저" };
+function onVoicePlay(e) {
+  const label = VOICE_SOURCE_LABEL[e.source] || e.source;
+  const delay = Math.round(e.delayMs);
+  const name = e.id ? `${e.id}_${e.variant}` : "실시간";
+  const queue = e.queueMs >= 50 ? ` (대기열 ${Math.round(e.queueMs)}ms)` : "";
+  devLog(els.voiceLog, `[${label}] ${name} p${e.priority} 지연 ${delay}ms${queue}${e.note ? ` · ${e.note}` : ""}\n“${e.text}”`, 60);
+  if (!devMode) return;
+  els.voiceSrcVal.textContent = label;
+  els.voiceDelayVal.textContent = `${delay}ms`;
+}
+function onVoiceStats(st) {
+  els.clipVal.textContent = st.error
+    ? "manifest 없음"
+    : `${st.loaded}/${st.total}${st.failed ? ` 실패 ${st.failed}` : ""}`;
+  if (st.error) setStatus(`녹음 파일 목록을 읽지 못해 /tts로 말합니다: ${st.error}`, "info", "voice");
+}
+
 // 음성 객체 → 화면 연결
 function onVoiceListenChange(state, text) {
   document.body.dataset.listen = state;
+  sound.setMute(state !== "off"); // 녹음 중에는 효과음·음성을 모두 끔 (듣기 시작·끝 신호음만 남김)
   els.talkPill.textContent = state === "on" ? "듣는 중" : state === "off" ? "말하기" : "잠시만요";
   listenText = state === "off" ? "" : text || "";
   renderStateLine();
@@ -1321,7 +1794,7 @@ function checkBrowser() {
   if (missing.length) msg += ` 이 브라우저에서 사용할 수 없는 기능: ${missing.join(", ")}`;
   els.startWarn.textContent = msg;
   els.startWarn.hidden = false;
-  els.startBtn.setAttribute("aria-label", "시작. 카메라와 음성 안내를 켭니다. 크롬 사용을 권장합니다");
+  els.startBtn.setAttribute("aria-label", "시작. 카메라와 음성 안내를 켜요. 크롬으로 열어 주세요");
 }
 
 // =====================================================================
@@ -1470,13 +1943,13 @@ function handleRuntimeError(kind, err) {
       })
       .catch((e) => {
         model.switching = false;
-        if (kind === "hand") fatal(e, "손 인식을 계속할 수 없어요. ");
+        if (kind === "hand") fatal(e, "fatal_hand");
         else { objectModelError = errorText(e); showError(e); }
       });
     return;
   }
   if (kind === "hand") {
-    fatal(err, "손 인식을 계속할 수 없어요. ", `${model.name} 실행 중 `);
+    fatal(err, "fatal_hand", `${model.name} 실행 중 `);
   } else {
     // 로컬 물체 인식은 대체용이므로 끄고 계속 진행
     try { model.task && model.task.close(); } catch (_) { /* 무시 */ }
@@ -1505,11 +1978,11 @@ async function openCamera() {
 
 function startErrorSpeech(err) {
   const name = err && err.name;
-  if (name === "NotAllowedError" || name === "SecurityError") return "카메라 권한이 없어서 시작하지 못했어요. 브라우저 설정에서 카메라를 허용해 주세요";
-  if (name === "NotFoundError" || name === "OverconstrainedError") return "카메라를 찾을 수 없어서 시작하지 못했어요";
-  if (name === "NotReadableError") return "다른 앱이 카메라를 쓰고 있어서 시작하지 못했어요";
-  if (/모델/.test(errorText(err))) return "인식 모델을 불러오지 못했어요. 인터넷 연결을 확인하고 시작 버튼을 다시 눌러 주세요";
-  return "시작하지 못했어요. 시작 버튼을 다시 눌러 주세요";
+  if (name === "NotAllowedError" || name === "SecurityError") return "start_camera_denied";
+  if (name === "NotFoundError" || name === "OverconstrainedError") return "start_camera_missing";
+  if (name === "NotReadableError") return "start_camera_busy";
+  if (/모델/.test(errorText(err))) return "start_model_failed";
+  return "start_failed";
 }
 
 async function start() {
@@ -1518,6 +1991,10 @@ async function start() {
   // 사용자 터치 안에서 바로 소리·음성 활성화 (모바일 정책)
   sound.unlock();
   voice.unlock();
+  // phrases.json(문장)과 manifest.json(녹음 파일 목록)을 불러오고 녹음 파일을 모두 미리 받기 시작
+  // (카메라·모델을 준비하는 동안)
+  const phrasesReady = loadPhrases();
+  voice.loadManifest();
   els.startWord.textContent = "준비 중";
   els.startNote.textContent = "카메라와 마이크 사용을 허용해 주세요";
   try {
@@ -1543,6 +2020,7 @@ async function start() {
       setStatus("모델 불러오는 중…");
     }
     await ensureModels();
+    const phrases = await phrasesReady; // 보통은 이미 끝나 있음 (최대 5초)
 
     sessionId++;
     readConfig();
@@ -1558,20 +2036,22 @@ async function start() {
     if (objectModelError) setStatus(`로컬 대체 모델 없음: ${objectModelError}`, "warn");
     else setStatus("");
     if (missingKeyNotice()) setStatus(missingKeyNotice(), "warn", "server");
+    if (!phrases.ok) setStatus(`phrases.json을 불러오지 못해 기본 문장만 사용합니다: ${phrases.error}`, "warn", "phrases");
     rafId = requestAnimationFrame(loop);
 
     // 화면 낭독기가 버튼 이름을 읽는 것과 겹치지 않게 조금 기다렸다가 안내
     const wait = Math.max(0, 900 - (performance.now() - shownAt));
     setTimeout(() => {
       if (!running) return;
-      voice.speak("준비됐어요. 말하기 버튼을 누르고 찾을 물건을 말씀해 주세요", PRIORITY.INFO, { group: "reply" });
-      if (!voice.supported.stt) voice.speak(NO_STT_MSG, PRIORITY.INFO);
-      else if (!micAvailable) voice.speak("마이크 권한이 없으면 음성 명령을 쓸 수 없어요. 브라우저 설정에서 마이크를 허용해 주세요", PRIORITY.INFO);
+      speakId("ready", PRIORITY.INFO, { group: "reply" });
+      if (!voice.supported.stt) speakId("no_stt", PRIORITY.INFO);
+      else if (!micAvailable) speakId("mic_denied", PRIORITY.INFO);
     }, wait);
   } catch (err) {
     stop();
     showError(err, "시작 실패 - ");
-    voice.speak(startErrorSpeech(err), PRIORITY.GUIDE);
+    await phrasesReady; // 오류 문장도 phrases.json 문장으로 (못 불러오면 기본 문장)
+    speakId(startErrorSpeech(err), PRIORITY.GUIDE);
   } finally {
     starting = false;
   }
@@ -1602,10 +2082,11 @@ function stop() {
   els.startBtn.focus({ preventScroll: true });
 }
 
-function fatal(err, speech, prefix = "") {
+// speechId: fatal_hand / fatal_frame
+function fatal(err, speechId, prefix = "") {
   stop();
   showError(err, prefix);
-  voice.speak(`${speech}시작 버튼을 다시 눌러 주세요`, PRIORITY.SAFETY);
+  speakId(speechId, PRIORITY.SAFETY);
 }
 
 // 화면이 꺼지지 않게 (지원하는 브라우저만)
@@ -1659,7 +2140,7 @@ function loop() {
   try {
     processFrame(video, performance.now());
   } catch (err) {
-    fatal(err, "문제가 생겨 안내를 멈췄어요. ", "프레임 처리 중 ");
+    fatal(err, "fatal_frame", "프레임 처리 중 ");
   }
 }
 
@@ -2143,9 +2624,7 @@ function enterLocalMode(msg) {
   const t = app.task;
   if (t && detectionActive() && !t.serverNoticeSaid) {
     t.serverNoticeSaid = true;
-    voice.speak(localOk
-      ? "서버 연결이 끊겨서 인식이 덜 정확할 수 있어요"
-      : `서버 연결이 끊겨서 지금은 ${eulReul(t.ko)} 찾을 수 없어요. 잠시 후 다시 시도할게요`, PRIORITY.INFO, { group: "server" });
+    speakId(localOk ? "server_degraded" : "server_unavailable", PRIORITY.INFO, { group: "server" });
   }
 }
 
@@ -2430,16 +2909,17 @@ function tickApp(now, hand) {
 // ---------------------------------------------------------------------
 // 사용자 명령에 대한 대답: 위치·손 안내 수준으로 바로 말함
 // interrupt=false: 지금 말하는 것("잠시만요" 등)이 끝난 뒤에 말함
-function reply(text, interrupt = true) {
-  voice.speak(text, PRIORITY.GUIDE, { group: "reply", interrupt });
+function replyId(id, interrupt = true) {
+  speakId(id, PRIORITY.GUIDE, { group: "reply", interrupt });
 }
-
-const UNKNOWN_OBJECT_MSG = "아직 모르는 물건이에요. 다른 이름으로 말씀해 주세요";
+function replyParts(parts, interrupt = true) {
+  speakParts(parts, PRIORITY.GUIDE, { group: "reply", interrupt });
+}
 
 function handleIntent(intent) {
   parseSeq++; // 기다리던 /parse 결과는 버림 (새 명령 우선)
   if (!running && intent.type !== "stop") {
-    reply("아직 준비 중이에요. 잠시 후 다시 말씀해 주세요");
+    replyId("not_ready");
     return;
   }
   switch (intent.type) {
@@ -2449,7 +2929,7 @@ function handleIntent(intent) {
     case "find": {
       let obj = intent.object;
       if (intent.empty) {
-        if (!defaultTarget) { reply("무엇을 찾을지 함께 말씀해 주세요. 예를 들어, 컵 찾아줘"); return; }
+        if (!defaultTarget) { replyId("ask_object_name"); return; }
         obj = defaultTarget;
       }
       if (!obj) {
@@ -2505,11 +2985,11 @@ async function parseWithServer(text) {
 
   if (!sentence || !cfg.server) {
     log(!sentence ? "보낼 문장 없음" : "서버 주소 없음");
-    reply(UNKNOWN_OBJECT_MSG);
+    replyId("unknown_object");
     return;
   }
   // 기다리는 동안 한 번
-  voice.speak("잠시만요", PRIORITY.GUIDE, { group: "wait", interrupt: true });
+  speakId("wait", PRIORITY.GUIDE, { group: "wait", interrupt: true });
 
   let parsed = null;
   try {
@@ -2534,7 +3014,7 @@ async function parseWithServer(text) {
 
   if (!parsed) {
     setStatus("문장 해석 실패", "warn", "voice");
-    reply(UNKNOWN_OBJECT_MSG, false);
+    replyId("unknown_object", false);
     return;
   }
   applyParseResult(parsed, sentence);
@@ -2566,11 +3046,11 @@ function applyParseResult(body, sentence) {
   // 찾기 (intent가 비어 있어도 targets가 있으면 찾기로 봄)
   if (!targets.length) {
     setStatus(`해석 결과에 찾을 물체가 없음: “${sentence}”`, "warn", "voice");
-    reply(UNKNOWN_OBJECT_MSG, false);
+    replyId("unknown_object", false);
     return;
   }
   const ko = toSpeech(body.object_ko) || koNameOf(targets[0]) || "말씀하신 물건";
-  startTask({ ko, targets }, `${ko} 찾아볼게요. 폰을 천천히 돌려주세요`);
+  startTask({ ko, targets }, true);
 }
 
 // "그만" 버튼·명령: 모든 안내 중지, 대기로
@@ -2580,46 +3060,50 @@ function stopGuidance(reason) {
   app.task = null;
   pauseDetection();
   setState(S.IDLE, reason);
-  voice.speak("안내를 멈췄어요", PRIORITY.INFO, { group: "reply" });
+  speakId("stopped", PRIORITY.INFO, { group: "reply" });
 }
 
 // 새 탐색 시작. obj: { ko, en } (사전) 또는 { ko, targets } (/parse)
-// message: /parse 결과로 시작하면 "○○ 찾아볼게요" ("잠시만요"를 끊지 않고 이어서 말함)
-function startTask(obj, message = "") {
+// fromParse: /parse 결과로 시작 ("잠시만요"를 끊지 않고 이어서 말함)
+function startTask(obj, fromParse = false) {
   parseSeq++; // 기다리던 /parse 결과는 버림
   const targets = obj.targets && obj.targets.length ? obj.targets : [obj.en];
+  // 사전에 있는 물건 하나면 대표 이름으로 통일 (머그 → 머그컵, 숫가락 → 숟가락): 미리 녹음한 문장과 화면 글자를 맞춤
+  // /parse가 "빨간 컵"처럼 꾸밈말을 붙여 주면 그 이름을 살려서 실시간으로 말함
+  const single = targets.length === 1 ? targets[0] : "";
+  const sameObject = Boolean(single) && (OBJECT_DICT[String(obj.ko || "").replace(/\s+/g, "")] === single || obj.ko === single);
+  const dictKo = sameObject ? koNameOf(single) : "";
+  const ko = dictKo || obj.ko;
   voice.clearGroups(["align", "correction", "lost", "hand", "grasp", "search", "found", "server"]);
-  app.task = newTask({ ko: obj.ko, targets });
+  app.task = newTask({ ko, targets });
+  app.task.foundId = (dictKo && objectPhraseId("found", single)) || "found";
   cfg.targets = targets;        // 서버에는 영어 이름으로 요청 (여러 개면 쉼표로 이어짐)
   cfgVersion++;
   resetObjectState();
-  enterSearch(`새 탐색: ${obj.ko} → ${targets.join(",")}`);
-  if (message) reply(message, false);
-  else reply(`${eulReul(obj.ko)} 찾을게요. 폰을 천천히 돌려주세요`);
+  enterSearch(`새 탐색: ${ko} → ${targets.join(",")}`);
+  const findId = dictKo && objectPhraseId("find", single);
+  // 사전 물건: find_{물건} / 그 밖: 실시간 "○○을 찾아볼게요." + 녹음 "폰을 천천히 돌려 주세요."
+  replyParts(findId ? [findId] : [{ text: `${eulReul(ko)} 찾아볼게요.` }, "turn_phone"], !fromParse);
 }
 
-// "어디": 현재 방향·거리 다시 안내
+// "어디": 현재 방향·거리 다시 안내 (짧은 녹음을 이어 붙임. 예: 왼쪽에 있어요. + 팔이 닿는 거리예요.)
 function speakWhere() {
   const t = app.task;
-  if (!t || app.state === S.IDLE || app.state === S.BOOT) {
-    reply("지금 찾는 물건이 없어요. 말하기 버튼을 누르고 찾을 물건을 말씀해 주세요");
-    return;
-  }
-  if (app.state === S.DONE) { reply(`${eulReul(t.ko)} 잡았어요`); return; }
-  if (app.state === S.SEARCH) { reply(`아직 ${eulReul(t.ko)} 찾는 중이에요. 폰을 천천히 돌려주세요`); return; }
+  if (!t || app.state === S.IDLE || app.state === S.BOOT) { replyId("no_task_where"); return; }
+  if (app.state === S.DONE) { replyId("already_grabbed"); return; }
+  if (app.state === S.SEARCH) { replyId("where_searching"); return; }
   const tg = lastResult.target;
   if (!tg) {
-    if (app.state === S.GUIDE && app.st.occluded) { reply("손 바로 앞에 있어요"); return; }
-    const side = t.lastCenter && t.lastCenter.x < 0.5 ? "왼쪽" : "오른쪽";
-    reply(`지금은 화면에 보이지 않아요. 마지막으로 ${side}에서 보였어요`);
+    if (app.state === S.GUIDE && app.st.occluded) { replyId("near_hand"); return; }
+    replyId(t.lastCenter && t.lastCenter.x < 0.5 ? "where_lost_left" : "where_lost_right");
     return;
   }
-  let text = `${horizontalPhrase(tg.center.x)} ${distancePhrase(tg.box.w)}`;
+  const parts = [horizontalId(tg.center.x), distanceId(tg.box.w)];
   if (app.state === S.GUIDE && app.st.guide) {
-    if (app.st.guide.inside) text += ". 손 바로 앞이에요";
-    else if (app.st.guide.dir) text += `. 손은 ${app.st.guide.dir} 옮기세요`;
+    if (app.st.guide.inside) parts.push("near_hand");
+    else if (app.st.guide.dir) parts.push(`where_hand_${app.st.guide.dir}`);
   }
-  reply(text);
+  replyParts(parts);
 }
 
 // "어떻게 잡아", "손잡이": grasp 문장 다시 말하기
@@ -2627,46 +3111,49 @@ function speakWhere() {
 function speakGrasp(fromUser) {
   const t = app.task;
   if (!t) {
-    if (fromUser) reply("지금 찾는 물건이 없어요. 찾을 물건을 먼저 말씀해 주세요");
+    if (fromUser) replyId("no_task_grasp");
     return;
   }
   const d = t.describe;
   if (d.grasp) {
     t.graspPending = false;
     t.graspRequested = false;
-    voice.speak(d.grasp, PRIORITY.GUIDE, { group: "grasp", keep: true, interrupt: fromUser });
+    speakLive(d.grasp, PRIORITY.GUIDE, { group: "grasp", keep: true, interrupt: fromUser });
     return;
   }
   if (!fromUser) { t.graspPending = true; return; }
   if (d.state === "inflight") {
     t.graspRequested = true;
-    reply("잡는 방법을 알아보는 중이에요. 알게 되면 바로 말씀드릴게요");
+    replyId("grasp_checking");
   } else if (d.state === "idle" && lastResult.target && detectionActive()) {
     t.graspRequested = true;
     requestDescribe();
-    reply("잡는 방법을 알아보는 중이에요. 알게 되면 바로 말씀드릴게요");
+    replyId("grasp_checking");
   } else if (d.state === "idle") {
-    reply("물건이 화면에 보이면 잡는 방법을 알려 드릴게요");
+    replyId("grasp_need_view");
   } else {
-    reply("잡는 방법 정보를 받지 못했어요");
+    replyId("grasp_unavailable");
   }
 }
 
 // ---------------------------------------------------------------------
 // 안내 문장 도우미
 // ---------------------------------------------------------------------
-function horizontalPhrase(cx) {
+function horizontalId(cx) {
   const off = cx - 0.5;
-  if (Math.abs(off) <= C.centerTolerance) return "정면에 있어요.";
-  return off < 0 ? "왼쪽에 있어요." : "오른쪽에 있어요.";
+  if (Math.abs(off) <= C.centerTolerance) return "pos_center";
+  return off < 0 ? "pos_left" : "pos_right";
 }
 
 // 거리 구간 (정확한 미터는 말하지 않음)
-function distancePhrase(boxW) {
-  if (boxW >= C.distNearRatio) return "팔 닿는 거리예요";
-  if (boxW >= C.distMidRatio) return "한두 걸음 앞이에요";
-  return "조금 멀리 있어요";
+function distanceId(boxW) {
+  if (boxW >= C.distNearRatio) return "dist_near";
+  if (boxW >= C.distMidRatio) return "dist_mid";
+  return "dist_far";
 }
+
+// 손 교정 방향 (move_{방향}, where_hand_{방향}) → #dev 화면 글자
+const DIR_LABEL = { left: "왼쪽으로", right: "오른쪽으로", forward: "앞으로", back: "몸 쪽으로" };
 
 // 같은 방향이 일정 시간 유지될 때만, 최소 간격·반복 제한을 지켜서 말함
 function makeCorrector() {
@@ -2736,8 +3223,7 @@ function checkLost(now, occluded) {
   if (miss >= C.lostTurnMs && now - (st.lostSaidAt ?? -Infinity) >= C.lostTurnRepeatMs) {
     st.lostSaidAt = now;
     // 마지막으로 보인 쪽으로 폰을 돌리게 안내
-    const side = t.lastCenter && t.lastCenter.x < 0.5 ? "왼쪽" : "오른쪽";
-    voice.speak(`폰을 천천히 ${side}으로 돌려주세요`, PRIORITY.GUIDE, { group: "lost" });
+    speakId(t.lastCenter && t.lastCenter.x < 0.5 ? "lost_turn_left" : "lost_turn_right", PRIORITY.GUIDE, { group: "lost" });
     if (st.corrector) st.corrector.mark(now);
   }
   return false;
@@ -2755,7 +3241,7 @@ function enterSearch(reason, lost = false) {
   t.missingSince = null;
   if (lost) {
     voice.clearGroups(["align", "correction", "lost", "hand", "found"]);
-    voice.speak("물건을 놓쳤어요. 폰을 천천히 돌려주세요", PRIORITY.GUIDE, { group: "search", interrupt: true });
+    speakId("lost_research", PRIORITY.GUIDE, { group: "search", interrupt: true });
   }
 }
 
@@ -2766,7 +3252,7 @@ function tickSearch(now) {
 
   // 찾는 동안은 조용히: 5초마다 짧은 효과음, 5초에 한 번 안내, 30초면 포기
   if (elapsed >= C.searchTimeoutMs) {
-    voice.speak("주변에서 찾지 못했어요", PRIORITY.GUIDE, { group: "search", interrupt: true });
+    speakId("search_timeout", PRIORITY.GUIDE, { group: "search", interrupt: true });
     app.task = null;
     pauseDetection();
     setState(S.IDLE, `${Math.round(C.searchTimeoutMs / 1000)}초 동안 못 찾음`);
@@ -2775,7 +3261,7 @@ function tickSearch(now) {
   if (!st.hintSaid && elapsed >= C.searchHintMs) {
     st.hintSaid = true;
     st.lastTickAt = now;
-    voice.speak("아직 못 찾았어요. 계속 천천히 돌려주세요", PRIORITY.GUIDE, { group: "search" });
+    speakId("search_hint", PRIORITY.GUIDE, { group: "search" });
   } else if (now - st.lastTickAt >= C.searchTickMs) {
     st.lastTickAt = now;
     if (!voice.isListening()) sound.searching();
@@ -2800,7 +3286,7 @@ function enterFound(now) {
   st.lostSaidAt = -Infinity;
   vibrate(200);
   voice.clearGroups(["search", "lost"]);
-  voice.speak("멈추세요", PRIORITY.GUIDE, { group: "found", interrupt: true });
+  speakId(app.task.foundId || "found", PRIORITY.GUIDE, { group: "found", interrupt: true }); // 예: 멈추세요. 컵이 보여요.
 }
 
 function tickFound(now, hand) {
@@ -2827,7 +3313,7 @@ function tickFound(now, hand) {
         st.centered = true;
         voice.clearGroups(["align"]);
         const near = tg.box.w >= C.distNearRatio;
-        voice.speak(`정면에 있어요. ${distancePhrase(tg.box.w)}${near ? ". 손을 천천히 뻗어 보세요" : ""}`, PRIORITY.GUIDE, { group: "align" });
+        speakParts(["pos_center", distanceId(tg.box.w), ...(near ? ["reach_out"] : [])], PRIORITY.GUIDE, { group: "align" });
         st.corrector.mark(now);
         // 가운데에 온 순간 /describe를 백그라운드로 한 번 호출
         requestDescribe();
@@ -2835,8 +3321,8 @@ function tickFound(now, hand) {
     } else {
       st.centerSince = null;
       // 물체가 왼쪽에 있으면 폰을 왼쪽으로
-      const dir = off < 0 ? "조금 왼쪽으로" : "조금 오른쪽으로";
-      st.corrector.update(dir, now, (text) => voice.speak(text, PRIORITY.GUIDE, { group: "align", ttl: C.correctionTtlMs }));
+      const dir = off < 0 ? "align_left" : "align_right";
+      st.corrector.update(dir, now, (id) => speakId(id, PRIORITY.GUIDE, { group: "align", ttl: C.correctionTtlMs }));
     }
   } else if (Math.abs(off) > C.centerRelease) {
     // 가운데에서 많이 벗어나면 다시 좌우 안내
@@ -2888,7 +3374,7 @@ function tickGuide(now, hand) {
     if (!st.handLostSaid) {
       st.handLostSaid = true;
       voice.clearGroups(["correction"]);
-      voice.speak("손이 화면에서 벗어났어요", PRIORITY.GUIDE, { group: "hand" });
+      speakId("hand_lost", PRIORITY.GUIDE, { group: "hand" });
       st.corrector.mark(now);
     }
   }
@@ -2919,14 +3405,14 @@ function tickGuide(now, hand) {
   const tipInBox = Boolean(st.box) && inBox(tip, st.box, 0);
   const inside = tipInBox || r <= (st.inTarget ? C.targetExitRadius : C.targetRadius);
 
-  // 목표 범위에 들어옴: 높은 음 한 번 + 진동, 처음이면 "거기예요. 잡으세요"
+  // 목표 범위에 들어옴: 높은 음 한 번 + 진동, 처음이면 "바로 거기예요. 잡아 보세요" (reached)
   if (inside && !st.inTarget) {
     sound.hit();
     vibrate(80);
     if (!t.reachedSaid) {
       t.reachedSaid = true;
       voice.clearGroups(["correction"]);
-      voice.speak("거기예요. 잡으세요", PRIORITY.GUIDE, { group: "correction" });
+      speakId("reached", PRIORITY.GUIDE, { group: "correction" });
       st.corrector.mark(now);
     }
   }
@@ -2946,11 +3432,11 @@ function tickGuide(now, hand) {
     const ax = Math.abs(dx);
     const ay = Math.abs(dy);
     if (Math.max(ax, ay) > C.correctionMin) {
-      if (ax >= ay) dir = dx > 0 ? "오른쪽으로" : "왼쪽으로";
-      else dir = dy < 0 ? "앞으로" : "몸 쪽으로";
+      if (ax >= ay) dir = dx > 0 ? "right" : "left";
+      else dir = dy < 0 ? "forward" : "back";
     }
   }
-  st.corrector.update(dir, now, (text) => voice.speak(text, PRIORITY.GUIDE, { group: "correction", ttl: C.correctionTtlMs }));
+  st.corrector.update(dir, now, (d) => speakId(`move_${d}`, PRIORITY.GUIDE, { group: "correction", ttl: C.correctionTtlMs }));
   st.guide = { dx, dy, r, dir, inside, interval: inside ? 0 : interval, pan };
 
   // ---- 잡기 성공: 엄지 끝·검지 끝이 모두 (사방 10% 넓힌) 박스 안에 1초 이상 ----
@@ -2977,9 +3463,9 @@ function enterDone() {
   voice.clearGroups(["align", "correction", "lost", "hand", "grasp", "found", "search"]);
   sound.success();
   vibrate([80, 60, 80]);
-  voice.speak("잡았어요", PRIORITY.GUIDE, { interrupt: true });
+  speakId("grabbed", PRIORITY.GUIDE, { interrupt: true });
   const t = app.task;
-  if (t.describe.comment) voice.speak(t.describe.comment, PRIORITY.INFO, { group: "comment" });
+  if (t.describe.comment) speakLive(t.describe.comment, PRIORITY.INFO, { group: "comment" });
   else if (t.describe.state === "inflight" || t.describe.state === "idle") t.commentPending = true;
 }
 
@@ -3055,7 +3541,7 @@ async function requestDescribe() {
     console.warn("설명 요청 실패", err);
     setStatus(`설명 요청 실패: ${errorText(err)}`, "warn", "describe");
     if (app.task === t && d.state === "failed") {
-      if (t.graspRequested) { t.graspRequested = false; voice.speak("잡는 방법 정보를 받지 못했어요", PRIORITY.INFO); }
+      if (t.graspRequested) { t.graspRequested = false; speakId("grasp_unavailable", PRIORITY.INFO); }
       t.graspPending = false;
       t.commentPending = false;
     }
@@ -3085,13 +3571,13 @@ function applyDescribe(t, body, crop, box) {
   d.state = "done";
 
   // 안전 경고는 즉시 (최우선)
-  if (d.safety) voice.speak(d.safety, PRIORITY.SAFETY, { group: "safety" });
+  if (d.safety) speakLive(d.safety, PRIORITY.SAFETY, { group: "safety" });
   // 손 안내 중에 기다리던 grasp, 사용자가 물어본 grasp
   if ((app.state === S.GUIDE && t.graspPending) || t.graspRequested) speakGrasp(false);
   // 완료 후에 기다리던 comment
   if (t.commentPending) {
     t.commentPending = false;
-    if (d.comment) voice.speak(d.comment, PRIORITY.INFO, { group: "comment" });
+    if (d.comment) speakLive(d.comment, PRIORITY.INFO, { group: "comment" });
   }
 }
 
@@ -3232,7 +3718,7 @@ function draw(handLandmarks, now) {
       ctx.setLineDash([]);
       if (st.guide) {
         const g = st.guide;
-        const label = `r ${g.r.toFixed(3)}  ${g.inside ? "목표 안" : g.dir || "–"}  ${g.inside ? "비프 없음" : `${g.interval}ms`}`;
+        const label = `r ${g.r.toFixed(3)}  ${g.inside ? "목표 안" : DIR_LABEL[g.dir] || "–"}  ${g.inside ? "비프 없음" : `${g.interval}ms`}`;
         const mx = ((st.hand.x + st.target.x) / 2) * W;
         const my = ((st.hand.y + st.target.y) / 2) * H;
         drawLabel(label, mx, my, s);
@@ -3381,7 +3867,7 @@ function updateDebug(detection, now) {
     lines.push(`손: ${st.hand ? `${st.hand.x.toFixed(2)}, ${st.hand.y.toFixed(2)}` : "없음"}  목표: ${st.target ? `${st.target.x.toFixed(2)}, ${st.target.y.toFixed(2)}` : "없음"}${st.occluded ? " (손에 가려짐)" : ""}`);
     if (g) {
       lines.push(`dx ${g.dx.toFixed(3)}  dy ${g.dy.toFixed(3)}  r ${g.r.toFixed(3)}`);
-      lines.push(`안내 방향: ${g.inside ? "목표 범위 안" : g.dir || "– (0.08 이하)"}`);
+      lines.push(`안내 방향: ${g.inside ? "목표 범위 안" : DIR_LABEL[g.dir] || "– (0.08 이하)"}`);
       lines.push(`비프 간격: ${g.inside ? "없음" : `${g.interval}ms`}  pan ${g.pan.toFixed(2)}`);
     } else {
       lines.push("비프: 멈춤");
@@ -3389,6 +3875,7 @@ function updateDebug(detection, now) {
     lines.push(`잡기 판정: ${st.graspSince !== null ? `${((now - st.graspSince) / 1000).toFixed(1)}초` : "–"}`);
   }
   lines.push(`음성: ${voice.isListening() ? "듣는 중" : voice.isSpeaking() ? "말하는 중" : "조용"} (대기열 ${voice.queueLength()})`);
+  lines.push(`문장: ${phrasesFrom} (id ${Object.keys(PHRASES).length}개)`);
   els.guideInfo.textContent = lines.join("\n");
 }
 

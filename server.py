@@ -13,7 +13,8 @@
   API_KEY(필수), MODEL_NAME, ALLOWED_ORIGINS, DEFAULT_IMGSZ, HALF,
   BATCH_WAIT_MS, MAX_BATCH, MAX_QUEUE, REQUEST_TIMEOUT,
   DETECT_RATE_PER_SEC, DESCRIBE_RATE_PER_MIN, PARSE_RATE_PER_MIN, RATE_LIMIT_BY,
-  GEMINI_API_KEY, GEMINI_MODEL, GEMINI_THINKING_LEVEL, PROMPT_FILE, TIMEZONE, LOG_DIR
+  GEMINI_API_KEY, GEMINI_MODEL, GEMINI_THINKING_LEVEL, PROMPT_FILE, TIMEZONE, LOG_DIR,
+  ELEVENLABS_API_KEY, ELEVENLABS_VOICE_ID, ELEVENLABS_LIVE_MODEL, TTS_DAILY_CHAR_LIMIT
 """
 
 from __future__ import annotations
@@ -34,7 +35,7 @@ import time
 from collections import OrderedDict, defaultdict, deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -46,12 +47,13 @@ import torch
 from fastapi import Depends, FastAPI, File, Form, Header, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from elevenlabs_tts import TTSConfig, TTSError, synthesize_async, write_atomic
 from vocab import ALIASES, BASE_VOCAB, SYNONYM_GROUPS
 
 
@@ -243,6 +245,7 @@ class Stats:
             "detect": summarize("detect"),
             "describe": summarize("describe"),
             "parse": summarize("parse"),
+            "tts": summarize("tts"),
             "batch": {
                 "count": len(batches),
                 "avg_size": round(float(np.mean(batches)), 2) if batches else None,
@@ -258,7 +261,7 @@ class CsvLogger:
 
     COLUMNS = [
         "time", "endpoint", "status", "code", "ip_hash", "client_hash", "targets", "n_detections",
-        "batch_size", "imgsz", "decode_ms", "vocab_ms", "queue_wait_ms", "inference_ms", "total_ms",
+        "batch_size", "imgsz", "decode_ms", "vocab_ms", "queue_wait_ms", "inference_ms", "total_ms", "chars",
     ]
 
     def __init__(self, directory: Path):
@@ -879,15 +882,109 @@ async def gemini_parse(text: str) -> tuple[dict, int]:
 
 
 # ---------------------------------------------------------------------------
+# 음성 생성 (/tts, ElevenLabs)
+# ---------------------------------------------------------------------------
+TTS_TIMEOUT = env_float("TTS_TIMEOUT", 8)  # ElevenLabs 응답 제한 시간(초)
+TTS_MAX_CHARS = env_int("TTS_MAX_CHARS", 200)
+TTS_RATE_PER_MIN = env_int("TTS_RATE_PER_MIN", 30)  # 기기(X-Client-Id)별, 없으면 IP별
+TTS_DAILY_CHAR_LIMIT = env_int("TTS_DAILY_CHAR_LIMIT", 5000)  # 실시간 생성 하루 글자 수 상한
+TTS_CACHE_DIR = STATIC_DIR / "audio" / "cache"  # /app/audio/cache/{해시}.mp3 로도 열림
+
+try:
+    tts_cfg: TTSConfig | None = TTSConfig.from_env()
+    tts_cfg_error = ""
+except ValueError as _e:  # 음성 설정 숫자가 잘못돼도 서버의 다른 기능은 그대로 동작하게
+    tts_cfg, tts_cfg_error = None, str(_e)
+
+tts_limiter = RateLimiter(TTS_RATE_PER_MIN, 60.0)
+_tts_http: httpx.AsyncClient | None = None
+_tts_inflight: dict[str, asyncio.Future] = {}
+
+
+class TtsRequest(BaseModel):
+    text: str = Field(..., min_length=1, description="읽어줄 한국어 문장")
+
+
+class TTSUsage:
+    """실시간 생성 글자 수를 날짜별로 세고 파일에 남김 (서버를 다시 켜도 그날 사용량 유지)"""
+
+    def __init__(self, path: Path, limit: int, tz: str):
+        self.path = path
+        self.limit = limit
+        self.tz = ZoneInfo(tz)
+        self.lock = threading.Lock()
+        self.date = self._today()
+        self.chars = 0
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if data.get("date") == self.date:
+                self.chars = int(data.get("chars", 0))
+        except (OSError, ValueError, AttributeError):
+            pass
+
+    def _today(self) -> str:
+        return datetime.now(self.tz).strftime("%Y-%m-%d")
+
+    def _roll(self) -> None:
+        today = self._today()
+        if today != self.date:  # 날짜가 바뀌면 0부터
+            self.date, self.chars = today, 0
+
+    def _save(self) -> None:
+        try:
+            write_atomic(self.path, json.dumps({"date": self.date, "chars": self.chars}).encode())
+        except OSError as e:
+            log.warning("TTS 사용량 파일 저장 실패: %s", e)
+
+    def used(self) -> int:
+        with self.lock:
+            self._roll()
+            return self.chars
+
+    def reserve(self, n: int) -> bool:
+        """생성 전에 글자 수를 미리 잡아둠 (동시 요청이 함께 상한을 넘지 않게)"""
+        with self.lock:
+            self._roll()
+            if self.chars + n > self.limit:
+                return False
+            self.chars += n
+            self._save()
+            return True
+
+    def refund(self, n: int) -> None:
+        """생성에 실패하면 잡아둔 글자 수를 돌려줌"""
+        with self.lock:
+            self._roll()
+            self.chars = max(0, self.chars - n)
+            self._save()
+
+    def seconds_until_reset(self) -> int:
+        now = datetime.now(self.tz)
+        midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        return max(1, int((midnight - now).total_seconds()))
+
+
+tts_usage = TTSUsage(LOG_DIR / "tts_usage.json", TTS_DAILY_CHAR_LIMIT, TIMEZONE)
+
+
+def tts_audio_response(audio: bytes | Path, source: str, gen_ms: float) -> Response:
+    headers = {"X-TTS-Source": source, "X-TTS-Ms": f"{gen_ms:.0f}", "Cache-Control": "no-store"}
+    if isinstance(audio, Path):
+        return FileResponse(audio, media_type="audio/mpeg", headers=headers)
+    return Response(content=audio, media_type="audio/mpeg", headers=headers)
+
+
+# ---------------------------------------------------------------------------
 # FastAPI 앱
 # ---------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global csv_log, _http
+    global csv_log, _http, _tts_http
     if not API_KEY:
         raise RuntimeError("환경변수 API_KEY 가 비어 있습니다.")
     if not ACCESS_LOG:
         logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+    logging.getLogger("httpx").setLevel(logging.WARNING)  # 바깥 API 호출을 한 줄씩 남기지 않음 (주소에 목소리 ID 포함)
     csv_log = CsvLogger(LOG_DIR)
     log.info("요청 기록 CSV: %s", csv_log.path)
     if not default_prompt():
@@ -895,11 +992,19 @@ async def lifespan(app: FastAPI):
     _http = httpx.AsyncClient(timeout=GEMINI_TIMEOUT)
     if not GEMINI_API_KEY:
         log.warning("GEMINI_API_KEY 가 없어 /describe 는 503을 돌려줍니다.")
+    _tts_http = httpx.AsyncClient(limits=httpx.Limits(max_connections=20, max_keepalive_connections=10))
+    if tts_cfg is None:
+        log.warning("음성 설정 오류로 /tts 를 끕니다: %s", tts_cfg_error)
+    elif not tts_cfg.enabled:
+        log.warning("ELEVENLABS_API_KEY 또는 ELEVENLABS_VOICE_ID 가 없어 /tts 는 503을 돌려줍니다.")
+    else:
+        log.info("TTS 사용: 실시간 모델 %s, 오늘 %d/%d자 사용", tts_cfg.live_model, tts_usage.used(), TTS_DAILY_CHAR_LIMIT)
     if not (STATIC_DIR / "index.html").is_file():
         log.warning("%s 가 없어 /app 은 404를 돌려줍니다.", STATIC_DIR / "index.html")
     threading.Thread(target=detector.load, name="model-loader", daemon=True).start()
     yield
     await _http.aclose()
+    await _tts_http.aclose()
 
 
 app = FastAPI(title="YOLOE Object Finder API", version="2.0.0", lifespan=lifespan)
@@ -909,6 +1014,7 @@ app.add_middleware(
     allow_credentials="*" not in ALLOWED_ORIGINS,
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["X-API-Key", "X-Client-Id", "Content-Type"],
+    expose_headers=["X-TTS-Source", "X-TTS-Ms", "Retry-After"],
 )
 
 
@@ -975,6 +1081,9 @@ async def health():
         "queue_length": detector.pending,
         "max_queue": MAX_QUEUE,
         "describe_enabled": bool(GEMINI_API_KEY and default_prompt()),
+        "tts_enabled": bool(tts_cfg and tts_cfg.enabled),
+        "tts_today_chars": tts_usage.used(),
+        "tts_daily_limit": TTS_DAILY_CHAR_LIMIT,
     }
     if detector.load_error:
         body["error"] = detector.load_error
@@ -1162,6 +1271,84 @@ async def parse(request: Request, body: ParseRequest):
         return {**result, "cached": cached, "attempts": attempts, "timing_ms": {"vlm": vlm_ms, "total": total}}
     except ApiError as e:
         record("parse", e.status, e.code, t_start, ip, cid)
+        raise
+
+
+@app.post("/tts", dependencies=[Depends(require_api_key)])
+async def tts(request: Request, body: TtsRequest):
+    t_start = time.perf_counter()
+    ip, cid = client_ip(request), client_id(request)
+    text = " ".join(body.text.split())
+    row: dict[str, Any] = {"chars": len(text)}  # CSV에는 문장 대신 글자 수만 남김
+    try:
+        if tts_cfg is None:
+            raise ApiError(503, "tts_disabled", f"음성 설정이 잘못되었습니다: {tts_cfg_error}")
+        if not tts_cfg.enabled:
+            raise ApiError(503, "tts_disabled", "서버에 ELEVENLABS_API_KEY 또는 ELEVENLABS_VOICE_ID 가 설정되지 않았습니다.")
+        allowed, retry = tts_limiter.allow(f"cid:{cid}" if cid else f"ip:{ip}")
+        if not allowed:
+            raise ApiError(429, "rate_limited", f"음성 요청이 너무 잦습니다 (분당 최대 {TTS_RATE_PER_MIN}회).",
+                           headers={"Retry-After": str(max(1, round(retry)))})
+        if not text:
+            raise ApiError(400, "invalid_text", "text 가 비어 있습니다.")
+        if len(text) > TTS_MAX_CHARS:
+            raise ApiError(400, "text_too_long", f"text 는 {TTS_MAX_CHARS}자 이내여야 합니다 (지금 {len(text)}자).")
+
+        model = tts_cfg.live_model
+        key = tts_cfg.cache_key(text, model)
+        path = TTS_CACHE_DIR / f"{key}.mp3"
+
+        # 1) 저장된 파일이 있으면 그대로 (하루 상한과 무관)
+        if path.is_file() and path.stat().st_size > 0:
+            record("tts", 200, "cache", t_start, ip, cid, **row)
+            return tts_audio_response(path, "cache", 0)
+
+        # 2) 같은 문장을 지금 만드는 중이면 그 결과를 기다림 (글자 수를 두 번 쓰지 않음)
+        fut = _tts_inflight.get(key)
+        if fut is not None:
+            audio = await asyncio.shield(fut)
+            gen_ms = ms(time.perf_counter() - t_start)
+            record("tts", 200, "generated", t_start, ip, cid, inference_ms=gen_ms, **row)
+            return tts_audio_response(audio, "generated", gen_ms)
+
+        # 3) 새로 생성: 하루 글자 수를 먼저 잡아둠
+        if not tts_usage.reserve(len(text)):
+            raise ApiError(
+                429, "tts_daily_limit",
+                f"오늘 음성 생성 한도({TTS_DAILY_CHAR_LIMIT}자)를 다 썼습니다. 저장된 문장은 계속 들을 수 있습니다.",
+                headers={"Retry-After": str(tts_usage.seconds_until_reset())},
+            )
+        fut = asyncio.get_running_loop().create_future()
+        _tts_inflight[key] = fut
+        t1 = time.perf_counter()
+        try:
+            audio = await synthesize_async(_tts_http, tts_cfg, text, model, TTS_TIMEOUT)
+            fut.set_result(audio)
+        except TTSError as e:
+            tts_usage.refund(len(text))
+            err = ApiError(502, e.code, e.message)  # 앱은 502를 받으면 브라우저 음성으로 대체
+            fut.set_exception(err)
+            fut.exception()  # 기다리는 쪽이 없어도 경고가 나지 않게
+            raise err from None
+        except BaseException as e:
+            tts_usage.refund(len(text))
+            fut.set_exception(ApiError(502, "tts_error", "음성 생성이 중단되었습니다."))
+            fut.exception()
+            raise
+        finally:
+            _tts_inflight.pop(key, None)
+        gen_ms = ms(time.perf_counter() - t1)
+
+        try:  # 저장에 실패해도 이번 응답은 그대로 보냄
+            await run_in_threadpool(write_atomic, path, audio)
+        except OSError as e:
+            log.warning("TTS 캐시 저장 실패: %s", e)
+
+        log.info("tts 생성 %d자 %.0fms (오늘 %d/%d자)", len(text), gen_ms, tts_usage.used(), TTS_DAILY_CHAR_LIMIT)
+        record("tts", 200, "generated", t_start, ip, cid, inference_ms=gen_ms, **row)
+        return tts_audio_response(audio, "generated", gen_ms)
+    except ApiError as e:
+        record("tts", e.status, e.code, t_start, ip, cid, **row)
         raise
 
 

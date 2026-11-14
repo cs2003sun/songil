@@ -1,9 +1,17 @@
-.env
-*.pt
-*.ts
-logs/
-*.csv
-__pycache__/
+
+# API 키가 들어 있는 설정 파일
+# 실시간 생성(/tts) 음성 캐시 (미리 생성한 static/audio/*.mp3 와 manifest.json 은 저장소에 포함해도 됨)
+# 실행 기록 (요청 CSV, TTS 사용량, 서버·터널 로그)
+# 파이썬 / 모델 파일
 *.backup.*
+*.csv
 *.deb
+*.pt
+*.pyc
+*.ts
+.env
+__pycache__/
 bus.jpg
+constraints.txt
+logs/
+static/audio/cache/

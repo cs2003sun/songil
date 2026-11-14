@@ -1,0 +1,9 @@
+.env
+*.pt
+*.ts
+logs/
+*.csv
+__pycache__/
+*.backup.*
+*.deb
+bus.jpg

@@ -53,7 +53,7 @@ python3 -c "import secrets; print(secrets.token_urlsafe(32))"   # API_KEY 로 �
 nano .env        # API_KEY, GEMINI_API_KEY, ELEVENLABS_API_KEY, ELEVENLABS_VOICE_ID, (고정 주소면) TUNNEL_TOKEN
 ```
 
-prompt.txt 의 `{현재시간}`은 요청 때마다 서버 시각(TIMEZONE, 기본 Asia/Seoul) 기준으로 바뀝니다: 5~11시 아침, 12~17시 오후, 그 밖은 저녁 (VLM 테스트 페이지와 같은 기준). `#`으로 시작하는 줄은 보내지 않고, 파일을 고치면 서버를 다시 켜지 않아도 다음 요청부터 반영됩니다.
+prompt.txt 의 `{대상}`은 `/describe` 요청의 `target`(없으면 `DESCRIBE_DEFAULT_TARGET`, 기본 컵), `{대상을}`은 받침에 맞춰 "컵을"·"텀블러를"로 바뀝니다. `{현재시간}`은 요청 때마다 서버 시각(TIMEZONE, 기본 Asia/Seoul) 기준으로 바뀝니다: 5~11시 아침, 12~17시 오후, 그 밖은 저녁 (VLM 테스트 페이지와 같은 기준). `#`으로 시작하는 줄은 보내지 않고, 파일을 고치면 서버를 다시 켜지 않아도 다음 요청부터 반영됩니다.
 
 프롬프트를 고쳐가며 시험하려면 브라우저에서 `https://주소/describe-test`를 여세요. 텍스트 상자에 prompt.txt 내용이 기본값으로 들어 있고, 고친 내용은 그 요청에만 쓰입니다 (prompt.txt는 바뀌지 않음). 사진 위 손잡이 점 표시, 문장 읽어주기, 빠진 항목·안심 표현 점검이 있습니다. 발표 때는 `.env`에서 `TEST_PAGE=0`으로 끌 수 있습니다.
 
@@ -156,9 +156,13 @@ curl -s -H "X-API-Key: $API_KEY" http://127.0.0.1:8000/stats | python3 -m json.t
 }
 ```
 
-`label`은 모델이 인식한 어휘 이름, `target`은 그 결과가 어떤 요청 이름 때문에 포함됐는지입니다 (동의어 그룹: cup을 요청하면 mug·tumbler 등도 찾음). 같은 물건이 두 이름으로 겹쳐 잡히면 점수 높은 것 하나만 남깁니다. `phone`→`cell phone`, `keys`→`key` 같은 별칭과 간단한 복수형은 자동으로 바꿉니다.
+`label`은 모델이 인식한 어휘 이름, `target`은 그 결과가 어떤 요청 이름 때문에 포함됐는지입니다 (동의어 그룹: cup을 요청하면 mug·tumbler 등도 찾음). 같은 물건이 두 이름으로 겹쳐 잡히면(cup/mug처럼 같은 요청 이름이나 같은 동의어 그룹) 점수 높은 것 하나만 남깁니다. 다른 물건끼리는 많이 겹쳐도 지우지 않으므로, 앞의 컵이 뒤의 물병을 가려도 둘 다 나옵니다. `phone`→`cell phone`, `keys`→`key` 같은 별칭과 간단한 복수형은 자동으로 바꿉니다.
 
-**POST /describe** (multipart): `image`, `prompt`(선택, 비우면 prompt.txt) → `{"result": {Gemini가 만든 JSON}, "model", "attempts", "time_of_day", "prompt_source", "timing_ms"}`
+**POST /describe** (multipart): `image`, `target`(선택, 설명할 물건 예: "검은 텀블러"), `prompt`(선택, 비우면 prompt.txt) → `{"result": {Gemini가 만든 JSON}, "safety_removed", "model", "attempts", "time_of_day", "target", "prompt_source", "custom_prompt_ignored", "timing_ms"}`
+
+- 기본 프롬프트의 결과에는 `hazard`(`hot`·`spill`·`edge`·`broken`·`sharp`·null)가 들어 있고, `safety`는 hazard가 있을 때만 채워집니다.
+- 서버가 어떤 프롬프트로 받은 결과든 `safety`를 한 번 더 거릅니다. hazard가 목록 밖이거나 없을 때, 일반 취급 주의(액정·화면·충전·떨어뜨리기 등)일 때, 안심시키는 말("뜨겁지 않아요" 등)일 때 `safety`를 null로 바꾸고 `safety_removed`에 이유(`no_hazard`·`generic_caution`·`reassuring`)를 적습니다. 앱이 `safety`가 있을 때만 경고를 띄운다면 앱을 고치지 않아도 경고 남발이 줄어듭니다.
+- `ALLOW_CUSTOM_PROMPT=0`이면 앱이 보낸 `prompt`는 무시하고 prompt.txt를 씁니다 (`custom_prompt_ignored: true`). `/describe-test` 페이지에서 보낸 것은 계속 허용합니다. 앱이 `target`만 보내도록 바뀐 뒤에 끄면 됩니다.
 
 **POST /parse** (JSON): `{"text": "내 검은 텀블러 어디 있어?"}` → 한국어 음성 명령을 Gemini로 해석
 
@@ -169,7 +173,7 @@ curl -s -H "X-API-Key: $API_KEY" http://127.0.0.1:8000/stats | python3 -m json.t
 }
 ```
 
-`intent`는 find / where / how / stop / unknown이고 서버가 바꾸지 않습니다. `where`라도 문장에 물건 이름이 있으면 `object_ko`와 `targets`를 둘 다 채워서 돌려주므로, 앱은 `object_ko`를 지금 찾는 물건과 비교해 새 물건인지 판단하면 됩니다. 둘 중 하나만 채워져 오면 Gemini에 한 번 더 묻고, 그래도 같으면 받은 결과를 그대로 돌려줍니다. "이거 어떻게 잡아?"처럼 물건 이름이 없으면 `object_ko: null`, `targets: []`입니다. `targets`는 0~3개의 영어 소문자 이름으로 `/detect`의 `targets`에 그대로 넣을 수 있습니다. 같은 문장(공백과 끝의 ?·! 차이는 무시)은 메모리에 저장한 결과를 다시 쓰고(`cached: true`), 기기(`X-Client-Id`, 없으면 IP)별로 분당 20회까지 받습니다. CSV에는 음성 문장 대신 해석된 targets만 남깁니다. 문장에 색 형용사(빨간, 까만, 은색, 분홍 등)가 있으면 targets 첫 번째가 `"red cup"`처럼 영어 색 단어 + 물건 이름이 되므로, 그대로 `/detect`에 넘기면 색상 필터가 적용됩니다. Gemini가 색을 빼먹으면 서버가 보충합니다.
+`intent`는 find / where / how / stop / unknown이고 서버가 바꾸지 않습니다. "잡았어", "잡았다", "이제 됐어", "고마워"도 `stop`이므로, 앱은 `stop`을 받으면 안내를 끝내면 됩니다. `where`라도 문장에 물건 이름이 있으면 `object_ko`와 `targets`를 둘 다 채워서 돌려주므로, 앱은 `object_ko`를 지금 찾는 물건과 비교해 새 물건인지 판단하면 됩니다. 둘 중 하나만 채워져 오면 Gemini에 한 번 더 묻고, 그래도 같으면 받은 결과를 그대로 돌려줍니다. "이거 어떻게 잡아?"처럼 물건 이름이 없으면 `object_ko: null`, `targets: []`입니다. `targets`는 0~3개의 영어 소문자 이름으로 `/detect`의 `targets`에 그대로 넣을 수 있습니다. 같은 문장(공백과 끝의 ?·! 차이는 무시)은 메모리에 저장한 결과를 다시 쓰고(`cached: true`), 기기(`X-Client-Id`, 없으면 IP)별로 분당 20회까지 받습니다. CSV에는 음성 문장 대신 해석된 targets만 남깁니다. 문장에 색 형용사(빨간, 까만, 은색, 분홍 등)가 있으면 targets 첫 번째가 `"red cup"`처럼 영어 색 단어 + 물건 이름이 되므로, 그대로 `/detect`에 넘기면 색상 필터가 적용됩니다. Gemini가 색을 빼먹으면 서버가 보충합니다.
 
 **POST /tts** (JSON): `{"text": "보드마카 찾아볼게요"}` → `audio/mpeg` (MP3)
 

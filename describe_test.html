@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>/describe 테스트</title>
+<style>
+  /* 색상 토큰 (라이트/다크) */
+  :root {
+    --paper: #EDF0F3; --surface: #FFFFFF; --ink: #1C2330; --muted: #5A6474; --line: #C9D1DB;
+    --accent: #F2C200; --on-accent: #1C2330; --focus: #1F5FD1;
+    --ok: #1C7448; --ok-bg: #E2F2E9; --bad: #B0261D; --bad-bg: #FBE6E4; --warn: #7A5200; --warn-bg: #FFF2CC;
+    --code-bg: #F5F7F9;
+    color-scheme: light;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --paper: #11151B; --surface: #19202A; --ink: #E5EAF0; --muted: #9AA5B3; --line: #2F3947;
+      --focus: #7FAEFF; --ok: #6CCB98; --ok-bg: #15301F; --bad: #F48A80; --bad-bg: #3B1D1A;
+      --warn: #F3CB72; --warn-bg: #3A2E12; --code-bg: #121821;
+      color-scheme: dark;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--paper); color: var(--ink);
+    font: 16px/1.55 "Apple SD Gothic Neo", "Malgun Gothic", "Noto Sans KR", system-ui, sans-serif;
+  }
+  main { max-width: 760px; margin: 0 auto; padding: 20px 16px 48px; }
+  h1 { font-size: 1.35rem; margin: 0 0 4px; }
+  h2 { font-size: 1.05rem; margin: 0 0 8px; }
+  .meta { color: var(--muted); font-size: .9rem; margin: 0 0 10px; }
+  .block { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 16px; margin-top: 16px; }
+  label { font-weight: 600; }
+  input[type=password], textarea, select {
+    width: 100%; font: inherit; color: var(--ink); background: var(--surface);
+    border: 1px solid var(--line); border-radius: 8px; padding: 10px;
+  }
+  textarea { min-height: 360px; font: 14px/1.5 ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace; resize: vertical; }
+  :focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 10px; }
+  .btn {
+    display: inline-flex; align-items: center; justify-content: center; min-height: 44px; padding: 0 16px;
+    font: inherit; font-weight: 600; color: var(--ink); background: var(--surface);
+    border: 1px solid var(--line); border-radius: 8px; cursor: pointer;
+  }
+  .btn.primary { background: var(--accent); color: var(--on-accent); border-color: var(--accent); }
+  .btn:disabled { opacity: .5; cursor: not-allowed; }
+  .vh { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+  .preview { position: relative; display: inline-block; max-width: 100%; margin-top: 12px; }
+  .preview img { display: block; max-width: 100%; max-height: 420px; border-radius: 8px; }
+  .dot {
+    position: absolute; width: 22px; height: 22px; margin: -11px 0 0 -11px; border-radius: 50%;
+    background: var(--accent); border: 3px solid #1C2330; box-shadow: 0 0 0 3px #fff;
+  }
+  pre { background: var(--code-bg); border: 1px solid var(--line); border-radius: 8px; padding: 12px; overflow-x: auto; font-size: 14px; margin: 10px 0 0; }
+  .badge { display: inline-block; padding: 2px 10px; border-radius: 999px; font-size: .85rem; font-weight: 600; }
+  .ok { background: var(--ok-bg); color: var(--ok); }
+  .bad { background: var(--bad-bg); color: var(--bad); }
+  .warn { background: var(--warn-bg); color: var(--warn); }
+  ul.warnings { margin: 10px 0 0; padding-left: 20px; color: var(--warn); }
+  .sentences p { margin: 6px 0; }
+  .sentences b { display: inline-block; min-width: 64px; color: var(--muted); font-weight: 600; }
+</style>
+</head>
+<body>
+<main>
+  <h1>/describe 테스트</h1>
+  <p class="meta">서버가 Gemini(<span id="modelName">__MODEL_NAME__</span>)를 대신 호출합니다. API 키는 이 페이지 안에서만 쓰고 저장하지 않아요.</p>
+
+  <section class="block">
+    <label for="apiKey">서버 API 키 (X-API-Key)</label>
+    <input type="password" id="apiKey" autocomplete="off" spellcheck="false" placeholder=".env 의 API_KEY">
+  </section>
+
+  <section class="block" aria-labelledby="h-prompt">
+    <h2 id="h-prompt">VLM 프롬프트</h2>
+    <p class="meta" id="timeHint">{현재시간}은 보낼 때 서버 시각 기준으로 아침, 오후, 저녁 중 하나로 바뀌어요.</p>
+    <label for="target">설명할 물건 ({대상}에 들어감, 비우면 서버 기본값)</label>
+    <input type="text" id="target" placeholder="예: 검은 텀블러" style="width:100%;font:inherit;padding:10px;border:1px solid var(--line);border-radius:8px;background:var(--surface);color:var(--ink);margin:0 0 10px">
+    <textarea id="prompt" spellcheck="false" aria-labelledby="h-prompt"></textarea>
+    <div class="row">
+      <button type="button" class="btn" id="resetPrompt">기본 프롬프트로 되돌리기</button>
+      <span class="meta" id="promptState" aria-live="polite"></span>
+    </div>
+  </section>
+
+  <section class="block" aria-labelledby="h-image">
+    <h2 id="h-image">사진</h2>
+    <div class="row">
+      <input type="file" id="camInput" accept="image/*" capture="environment" class="vh">
+      <label class="btn" for="camInput">카메라로 촬영</label>
+      <input type="file" id="fileInput" accept="image/*" class="vh">
+      <label class="btn" for="fileInput">사진 파일 선택</label>
+      <label for="maxSide" class="vh">전송 전 축소</label>
+      <select id="maxSide" style="width:auto">
+        <option value="512">긴 변 512px</option>
+        <option value="1024" selected>긴 변 1024px</option>
+        <option value="0">원본</option>
+      </select>
+    </div>
+    <div class="preview" id="preview" hidden><img id="previewImg" alt="선택한 사진"><div class="dot" id="dot" hidden></div></div>
+    <div class="row">
+      <button type="button" class="btn primary" id="send" disabled>전송</button>
+      <button type="button" class="btn" id="speak" disabled>문장 읽어주기</button>
+    </div>
+  </section>
+
+  <section class="block" aria-labelledby="h-result">
+    <h2 id="h-result">결과</h2>
+    <div id="status" aria-live="polite" class="meta">사진을 고르고 전송을 누르세요.</div>
+    <div class="sentences" id="sentences"></div>
+    <ul class="warnings" id="warnings"></ul>
+    <pre id="raw" hidden></pre>
+  </section>
+</main>
+
+<script>
+// 서버가 prompt.txt 내용을 이 자리에 넣어준다
+const DEFAULT_PROMPT = __DEFAULT_PROMPT_JSON__;
+
+const $ = id => document.getElementById(id);
+const promptBox = $('prompt');
+let imageBlob = null;
+let lastResult = null;
+
+// ---- 프롬프트 ----
+promptBox.value = DEFAULT_PROMPT;
+function updatePromptState() {
+  const custom = promptBox.value.trim() !== DEFAULT_PROMPT.trim();
+  $('promptState').textContent = custom ? '수정됨: 이 내용을 함께 보냅니다' : '기본 프롬프트(prompt.txt) 사용';
+}
+promptBox.addEventListener('input', updatePromptState);
+$('resetPrompt').addEventListener('click', () => { promptBox.value = DEFAULT_PROMPT; updatePromptState(); });
+updatePromptState();
+
+// ---- 사진 (EXIF 회전 반영 후 축소해서 JPEG로) ----
+async function prepareImage(file) {
+  const maxSide = parseInt($('maxSide').value, 10);
+  const bmp = await createImageBitmap(file, { imageOrientation: 'from-image' });
+  const scale = maxSide > 0 ? Math.min(1, maxSide / Math.max(bmp.width, bmp.height)) : 1;
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.round(bmp.width * scale);
+  canvas.height = Math.round(bmp.height * scale);
+  canvas.getContext('2d').drawImage(bmp, 0, 0, canvas.width, canvas.height);
+  return new Promise(res => canvas.toBlob(res, 'image/jpeg', 0.9));
+}
+let currentFile = null;
+async function onPick(e) {
+  const file = e.target.files && e.target.files[0];
+  if (!file) return;
+  currentFile = file;
+  await refreshImage();
+  e.target.value = '';
+}
+async function refreshImage() {
+  if (!currentFile) return;
+  imageBlob = await prepareImage(currentFile);
+  $('previewImg').src = URL.createObjectURL(imageBlob);
+  $('preview').hidden = false;
+  $('dot').hidden = true;
+  $('send').disabled = false;
+  $('status').textContent = `사진 준비됨 (${Math.round(imageBlob.size / 1024)} KB)`;
+}
+$('camInput').addEventListener('change', onPick);
+$('fileInput').addEventListener('change', onPick);
+$('maxSide').addEventListener('change', refreshImage);
+
+// ---- 결과 점검: 빠진 항목, 허용 값, "안심시키는 말" ----
+const DIRECTIONS = ['left', 'right', 'near', 'far', 'none', 'unknown'];
+const REASSURE = /(뜨겁지\s*않|안전해요|안전합니다|안전하니|걱정\s*(마|하지|없))/;
+function check(o) {
+  const w = [];
+  if (!o || typeof o !== 'object' || Array.isArray(o)) return ['JSON 객체가 아니에요'];
+  ['object', 'direction', 'handle_point', 'hazard', 'safety', 'grasp', 'comment', 'confidence'].forEach(k => {
+    if (!(k in o)) w.push(`"${k}" 항목이 없어요`);
+  });
+  if ('direction' in o && !DIRECTIONS.includes(o.direction)) w.push(`direction 값이 허용 목록 밖이에요: ${JSON.stringify(o.direction)}`);
+  if ('hazard' in o && o.hazard !== null && !['hot', 'spill', 'edge', 'broken', 'sharp'].includes(o.hazard)) w.push(`hazard 값이 허용 목록 밖이에요: ${JSON.stringify(o.hazard)}`);
+  if ('confidence' in o && !['high', 'low'].includes(o.confidence)) w.push(`confidence 값이 허용 목록 밖이에요: ${JSON.stringify(o.confidence)}`);
+  const p = o.handle_point;
+  if (p != null && !(typeof p.x === 'number' && typeof p.y === 'number' && p.x >= 0 && p.x <= 1 && p.y >= 0 && p.y <= 1)) {
+    w.push(`handle_point가 0~1 범위의 숫자가 아니에요: ${JSON.stringify(p)}`);
+  }
+  ['safety', 'grasp', 'comment'].forEach(k => {
+    if (typeof o[k] === 'string' && REASSURE.test(o[k])) w.push(`안심 표현 의심 (${k}): ${o[k]}`);
+  });
+  return w;
+}
+
+function showSentences(o) {
+  const box = $('sentences');
+  box.replaceChildren();
+  [['안전', 'safety'], ['잡는 법', 'grasp'], ['한마디', 'comment']].forEach(([name, k]) => {
+    if (o && o[k]) {
+      const p = document.createElement('p');
+      const b = document.createElement('b');
+      b.textContent = name;
+      p.append(b, ' ', String(o[k]));
+      box.append(p);
+    }
+  });
+}
+
+// ---- 전송 ----
+$('send').addEventListener('click', async () => {
+  if (!imageBlob) return;
+  const key = $('apiKey').value.trim();
+  if (!key) { $('status').textContent = 'API 키를 입력하세요.'; $('apiKey').focus(); return; }
+
+  const fd = new FormData();
+  fd.append('image', imageBlob, 'photo.jpg');
+  if (promptBox.value.trim() !== DEFAULT_PROMPT.trim()) fd.append('prompt', promptBox.value);
+  if ($('target').value.trim()) fd.append('target', $('target').value.trim());
+
+  $('send').disabled = true;
+  $('speak').disabled = true;
+  $('warnings').replaceChildren();
+  $('sentences').replaceChildren();
+  $('dot').hidden = true;
+  $('status').textContent = '보내는 중…';
+  const t0 = performance.now();
+  try {
+    const r = await fetch('describe', { method: 'POST', headers: { 'X-API-Key': key, 'X-Client-Id': 'describe-test-page' }, body: fd });
+    const rtt = Math.round(performance.now() - t0);
+    const body = await r.json().catch(() => null);
+    $('raw').hidden = false;
+    $('raw').textContent = JSON.stringify(body, null, 2);
+    if (!r.ok) {
+      const msg = body && body.error ? `${body.error.code}: ${body.error.message}` : `HTTP ${r.status}`;
+      $('status').innerHTML = `<span class="badge bad">실패</span> `;
+      $('status').append(`${msg} (왕복 ${rtt} ms)`);
+      return;
+    }
+    lastResult = body.result;
+    const t = body.timing_ms || {};
+    $('status').innerHTML = `<span class="badge ok">성공</span> `;
+    $('status').append(`왕복 ${rtt} ms · Gemini ${t.vlm} ms · 시도 ${body.attempts}회 · 시간대 ${body.time_of_day} · ${body.prompt_source === 'custom' ? '수정한 프롬프트' : '기본 프롬프트'} · 대상 ${body.target}${body.safety_removed ? ` · 서버가 safety 제거(${body.safety_removed})` : ''}`);
+    showSentences(lastResult);
+    check(lastResult).forEach(w => { const li = document.createElement('li'); li.textContent = w; $('warnings').append(li); });
+    const p = lastResult && lastResult.handle_point;
+    if (p && typeof p.x === 'number' && typeof p.y === 'number') {
+      $('dot').style.left = `${Math.min(1, Math.max(0, p.x)) * 100}%`;
+      $('dot').style.top = `${Math.min(1, Math.max(0, p.y)) * 100}%`;
+      $('dot').hidden = false;
+    }
+    $('speak').disabled = false;
+  } catch (err) {
+    $('status').textContent = `연결 오류: ${err.message}`;
+  } finally {
+    $('send').disabled = false;
+  }
+});
+
+// ---- 문장 읽어주기 (안전 → 잡는 법 → 한마디 순서) ----
+$('speak').addEventListener('click', () => {
+  if (!lastResult || !('speechSynthesis' in window)) return;
+  speechSynthesis.cancel();
+  ['safety', 'grasp', 'comment'].forEach(k => {
+    if (lastResult[k]) {
+      const u = new SpeechSynthesisUtterance(String(lastResult[k]));
+      u.lang = 'ko-KR';
+      speechSynthesis.speak(u);
+    }
+  });
+});
+</script>
+</body>
+</html>

@@ -98,7 +98,7 @@ MAX_TARGETS = env_int("MAX_TARGETS", 10)
 MAX_RESULTS_ALL = env_int("MAX_RESULTS_ALL", 20)  # targets 없이 전체 탐지할 때 최대 결과 수
 MAX_EXTRA_VOCAB = env_int("MAX_EXTRA_VOCAB", 100)  # 요청으로 추가되는 단어 최대 개수 (넘으면 오래 안 쓴 것부터 제거)
 SYNONYMS = env_bool("SYNONYMS", True)
-DEDUPE_IOU = env_float("DEDUPE_IOU", 0.6)  # 같은 물건이 cup/mug로 두 번 잡히면 하나만 남김
+DEDUPE_IOU = env_float("DEDUPE_IOU", 0.6)  # 같은 물건이 cup/mug로 두 번 잡히면 하나만 남김 (같은 이름 그룹끼리만)
 MAX_IMAGE_BYTES = int(env_float("MAX_IMAGE_MB", 8) * 1024 * 1024)
 
 # ---- 색상 구분 (/detect 후처리) ---------------------------------------------
@@ -517,6 +517,7 @@ class Job:
     future: asyncio.Future
     loop: asyncio.AbstractEventLoop
     max_results: int | None = None  # 전체 탐지 모드에서만 개수 제한
+    mode: str = "targets"  # "targets" 또는 "all"
 
 
 class Detector:
@@ -750,24 +751,37 @@ class Detector:
             log.debug("batch size=%d imgsz=%d infer=%.1fms", len(jobs), imgsz, ms(t1 - t0))
 
     @staticmethod
+    def _same_object_name(job: Job, a: str, b: str) -> bool:
+        """두 이름이 같은 물건을 가리킬 수 있는지 (중복 박스 정리 대상인지)
+        - targets 모드: 같은 요청 이름에서 나온 이름끼리 (cup 요청의 cup·mug·tumbler)
+        - 전체 탐지: 같은 이름이거나 같은 동의어 그룹
+        다른 물건끼리는 많이 겹쳐도 지우지 않는다 (앞의 컵이 뒤의 물병을 가려도 둘 다 남김)"""
+        if a == b:
+            return True
+        if job.mode == "targets":
+            return job.label_to_target.get(a, a) == job.label_to_target.get(b, b)
+        return b in _SYNONYM_INDEX.get(a, ())
+
+    @staticmethod
     def _build_detections(job: Job, ids: set[int], ex) -> list[dict]:
         if ex is None:
             return []
         xyxyn, scores, classes, names = ex
         order = np.argsort(-scores)  # 신뢰도 높은 순
-        kept: list[np.ndarray] = []
+        kept: list[tuple[str, np.ndarray]] = []  # (이름, 박스)
         dets: list[dict] = []
         for k in order:
             c, s = int(classes[k]), float(scores[k])
             if c not in ids or s < job.conf:
                 continue
             box = np.clip(xyxyn[k], 0.0, 1.0)
-            if any(iou(box, kb) >= DEDUPE_IOU for kb in kept):  # 같은 물건이 다른 이름으로 또 잡힌 경우
+            label = names[c]
+            # 같은 물건이 비슷한 이름(cup/mug)으로 또 잡힌 경우만 지움
+            if any(iou(box, kb) >= DEDUPE_IOU and Detector._same_object_name(job, label, kl) for kl, kb in kept):
                 continue
-            kept.append(box)
+            kept.append((label, box))
             if job.max_results is not None and len(dets) >= job.max_results:
                 break
-            label = names[c]
             x1, y1, x2, y2 = (float(v) for v in box)
             dets.append({
                 "label": label,
@@ -789,6 +803,17 @@ _thinking_supported = True
 _prompt_cache: tuple[float, str] = (-1.0, "")  # (파일 수정 시각, 내용)
 MAX_PROMPT_CHARS = env_int("MAX_PROMPT_CHARS", 4000)
 TEST_PAGE = env_bool("TEST_PAGE", True)  # GET /describe-test 페이지 제공 여부
+# 0이면 앱이 보낸 prompt 를 무시하고 prompt.txt 사용 (테스트 페이지에서 보낸 것만 허용)
+ALLOW_CUSTOM_PROMPT = env_bool("ALLOW_CUSTOM_PROMPT", True)
+DESCRIBE_DEFAULT_TARGET = os.getenv("DESCRIBE_DEFAULT_TARGET", "컵")  # target 을 안 보내면 이 물건으로
+TEST_PAGE_CLIENT_ID = "describe-test-page"
+
+# ---- /describe 주의 문장(safety) 필터: 어떤 프롬프트로 받은 결과에도 적용 ----
+HAZARDS = {"hot", "spill", "edge", "broken", "sharp"}  # 김·끓음 / 가득 찬 음료 / 책상 가장자리 / 깨짐 / 칼날 등
+# 사진에 보이는 위험이 아닌 일반적인 취급 주의 (예: "액정 조심하세요", "화면이 켜져 있어요")
+GENERIC_CAUTION_RE = re.compile(r"액정|화면|디스플레이|충전|배터리|전원|케이블|떨어뜨|떨어트|떨구")
+# 안심시키는 말 (시각장애인이 믿고 행동하면 위험하므로 금지)
+REASSURE_RE = re.compile(r"뜨겁지\s*않|안전해요|안전합니다|안전하니|걱정\s*(마|하지|없)")
 
 
 def default_prompt() -> str:
@@ -812,18 +837,68 @@ def time_of_day(now: datetime) -> str:
     return "아침" if 5 <= h < 12 else "오후" if 12 <= h < 18 else "저녁"
 
 
-def render_prompt(template: str) -> tuple[str, str]:
-    """자리표시자 치환. 반환: (완성된 프롬프트, 시간대)"""
+def with_object_particle(word: str) -> str:
+    """'컵' → '컵을', '리모컨' → '리모컨을', '텀블러' → '텀블러를' (받침 여부로 을/를)"""
+    last = word[-1] if word else ""
+    if "가" <= last <= "힣":
+        return word + ("을" if (ord(last) - 0xAC00) % 28 else "를")
+    return word + "을(를)"
+
+
+def clean_describe_target(raw: str | None) -> str:
+    """프롬프트에 넣을 물건 이름 정리: 줄바꿈·중괄호·따옴표 제거, 30자 이내. 비면 기본값"""
+    t = re.sub(r"[\r\n{}\"`]", " ", raw or "")
+    t = " ".join(t.split())[:30]
+    return t or DESCRIBE_DEFAULT_TARGET
+
+
+def render_prompt(template: str, target: str | None = None) -> tuple[str, str]:
+    """자리표시자 치환. 반환: (완성된 프롬프트, 시간대)
+    {현재시간} → 아침/오후/저녁, {대상} → 물건 이름, {대상을} → 물건 이름 + 을/를"""
     now = datetime.now(ZoneInfo(TIMEZONE))
     tod = time_of_day(now)
     weekday = "월화수목금토일"[now.weekday()]
+    obj = clean_describe_target(target)
     # str.format 대신 replace: 프롬프트 안의 JSON 중괄호와 충돌하지 않게
     text = (
         template.replace("{현재시간}", tod)
         .replace("{time_of_day}", tod)
         .replace("{now}", now.strftime(f"%Y-%m-%d %H:%M ({weekday})"))
+        .replace("{대상을}", with_object_particle(obj))
+        .replace("{대상}", obj)
     )
     return text, tod
+
+
+def sanitize_describe_result(result: Any) -> tuple[Any, str | None]:
+    """Gemini 결과의 주의 문장 정리. 반환: (정리된 결과, 지운 이유 또는 None)
+    - hazard 가 있는 결과: hazard 가 목록 밖이거나 null 이면 safety 도 null
+    - 어떤 결과든: 일반 취급 주의(액정·화면·충전 등)나 안심시키는 말이면 safety 를 null
+    앱은 safety 가 있을 때만 경고 화면을 띄우므로, 앱을 고치지 않아도 빨간 경고 남발이 줄어든다."""
+    if not isinstance(result, dict):
+        return result, None
+    r = dict(result)
+    reason = None
+    if "hazard" in r:
+        h = r.get("hazard")
+        h = h.strip().lower() if isinstance(h, str) else None
+        r["hazard"] = h if h in HAZARDS else None
+        if r["hazard"] is None and r.get("safety"):
+            r["safety"], reason = None, "no_hazard"
+    safety = r.get("safety")
+    if safety is not None:
+        s = safety.strip() if isinstance(safety, str) else ""
+        if not s or s.lower() == "null":
+            r["safety"] = None
+        elif GENERIC_CAUTION_RE.search(s):
+            r["safety"], reason = None, "generic_caution"
+        elif REASSURE_RE.search(s):
+            r["safety"], reason = None, "reassuring"
+        if r["safety"] is None and "hazard" in r:
+            r["hazard"] = None
+    if reason:
+        log.info("/describe: safety 문장 제거 (%s): %s", reason, safety)
+    return r, reason
 
 
 def prepare_describe_image(data: bytes) -> bytes:
@@ -915,7 +990,8 @@ intent
 - find: 물건을 찾아 달라는 요청 (예: "컵 찾아줘", "리모컨 좀 찾아 줄래")
 - where: 물건이 어디 있는지 묻는 질문 (예: "내 열쇠 어디 있어?")
 - how: 물건을 어떻게 잡거나 쓰는지 묻는 질문 (예: "이거 어떻게 잡아?", "손잡이 어느 쪽이야?")
-- stop: 안내를 멈추라는 말 (예: "그만", "멈춰", "됐어", "찾았어")
+- stop: 안내를 멈추라는 말, 또는 물건을 찾았거나 손에 잡아서 다 됐다는 말
+  (예: "그만", "멈춰", "됐어", "이제 됐어", "찾았어", "잡았어", "잡았다", "손에 잡혔어", "고마워")
 - unknown: 위에 해당하지 않거나 알아들을 수 없는 말
 
 object_ko와 targets는 intent와 상관없이 채워
@@ -953,6 +1029,8 @@ targets: 물체 인식 모델에 넣을 영어 물체 이름
 "아까 그 안경 어디 있어?" → {"intent": "where", "object_ko": "안경", "targets": ["glasses", "eyeglasses"]}
 "이거 어떻게 잡아?" → {"intent": "how", "object_ko": null, "targets": []}
 "지갑 찾았어" → {"intent": "stop", "object_ko": "지갑", "targets": ["wallet"]}
+"컵 잡았어" → {"intent": "stop", "object_ko": "컵", "targets": ["cup"]}
+"잡았다, 고마워" → {"intent": "stop", "object_ko": null, "targets": []}
 "그만해" → {"intent": "stop", "object_ko": null, "targets": []}
 "오늘 날씨 어때?" → {"intent": "unknown", "object_ko": null, "targets": []}
 
@@ -1352,7 +1430,7 @@ async def detect(
 
         imgsz = max(32, int(round(imgsz / 32)) * 32)
         loop = asyncio.get_running_loop()
-        job = Job(img, label_to_target, conf, imgsz, time.perf_counter(), loop.create_future(), loop, max_results)
+        job = Job(img, label_to_target, conf, imgsz, time.perf_counter(), loop.create_future(), loop, max_results, mode)
         detector.submit(job)
         try:
             out = await asyncio.wait_for(job.future, timeout=REQUEST_TIMEOUT + 2.0)
@@ -1402,13 +1480,18 @@ async def describe(
     request: Request,
     image: UploadFile = File(..., description="사진 (책상을 내려다본 사진 또는 컵 부분)"),
     prompt: str | None = Form(None, description="프롬프트를 바꿔 보낼 때만. 비우면 prompt.txt 사용"),
+    target: str | None = Form(None, description="설명할 물건 이름 (예: 검은 텀블러). 비우면 DESCRIBE_DEFAULT_TARGET"),
 ):
     t_start = time.perf_counter()
     ip, cid = client_ip(request), client_id(request)
     try:
         if not GEMINI_API_KEY:
             raise ApiError(503, "describe_disabled", "서버에 GEMINI_API_KEY 가 설정되지 않았습니다.")
-        template = (prompt or "").strip() or default_prompt()
+        custom = (prompt or "").strip()
+        custom_ignored = False
+        if custom and not ALLOW_CUSTOM_PROMPT and cid != TEST_PAGE_CLIENT_ID:
+            custom, custom_ignored = "", True  # 앱이 보낸 지시문 대신 서버 규칙(prompt.txt)을 씀
+        template = custom or default_prompt()
         if not template:
             raise ApiError(503, "describe_disabled", f"프롬프트 파일({PROMPT_FILE})이 없거나 비어 있습니다.")
         if len(template) > MAX_PROMPT_CHARS:
@@ -1422,7 +1505,7 @@ async def describe(
         jpeg = await run_in_threadpool(prepare_describe_image, await image.read())
         decode_ms = ms(time.perf_counter() - t0)
 
-        rendered, tod = render_prompt(template)
+        rendered, tod = render_prompt(template, target)
         t1 = time.perf_counter()
         result, attempts = None, 0
         for attempts in (1, 2):  # JSON이 아니면 한 번만 다시 시도
@@ -1434,14 +1517,18 @@ async def describe(
         vlm_ms = ms(time.perf_counter() - t1)
         if result is None:
             raise ApiError(502, "vlm_invalid_json", "Gemini 응답이 두 번 모두 JSON 형식이 아니었습니다.")
+        result, safety_removed = sanitize_describe_result(result)
 
         record("describe", 200, "ok", t_start, ip, cid, decode_ms=decode_ms, inference_ms=vlm_ms)
         return {
             "result": result,
+            "safety_removed": safety_removed,
             "model": GEMINI_MODEL,
             "attempts": attempts,
             "time_of_day": tod,
-            "prompt_source": "custom" if (prompt or "").strip() else "default",
+            "target": clean_describe_target(target),
+            "prompt_source": "custom" if custom else "default",
+            "custom_prompt_ignored": custom_ignored,
             "timing_ms": {"decode": decode_ms, "vlm": vlm_ms, "total": ms(time.perf_counter() - t_start)},
         }
     except ApiError as e:

@@ -134,15 +134,24 @@ curl -s -H "X-API-Key: $API_KEY" http://127.0.0.1:8000/stats | python3 -m json.t
 **POST /detect** (multipart): `image`, `targets`(선택, "cup,key"), `conf`(0.25), `imgsz`(640)
 
 - `targets`가 있으면 `mode: "targets"`: 그 물체만 찾습니다 (최대 10개 이름).
-- `targets`가 없거나 비어 있으면 `mode: "all"`: 기본 어휘 전체에서 찾되 배경 물체(table, desk, chair, person, window, door 등, vocab.py의 `BACKGROUND`)는 빼고 신뢰도 높은 순으로 최대 20개(`MAX_RESULTS_ALL`)를 돌려줍니다. 이때 `target`은 `label`과 같습니다.
+- `targets`에 색 단어(black, white, gray/grey/silver, red, orange, yellow, green, blue, purple, pink, brown)가 있으면 색상 필터를 씁니다. 예: `targets="red cup,cup"`
+  - YOLOE에는 색을 뺀 이름(`cup`)만 보내 형태로 찾고, 박스의 상하좌우 25%를 뺀 중앙 50% 영역에서 그 색 픽셀(HSV 기준) 비율을 잽니다.
+  - 비율이 `COLOR_MIN_RATIO`(0.30) 이상인 박스만 남기고, `score`를 `score × (0.6 + 0.4 × 일치율)`로 바꿔 다시 정렬합니다. 각 박스에 `color_match`(0~1)가 붙습니다.
+  - 색이 달라 빠진 박스는 `color_rejected`에 `label`, `box`, `dominant_color`(가장 많은 색, 20% 미만이면 unknown)와 함께 최대 5개 들어갑니다.
+  - 분홍은 빨강·보라 기준과 겹치므로, 빨강·보라 일치율을 셀 때는 분홍 픽셀을 뺍니다 (`COLOR_EXCLUDE`). 그래서 `red cup`으로 찾으면 분홍 컵은 빠집니다.
+  - 색 기준값은 server.py 맨 위 `COLOR_HSV_RULES`에서 고칩니다. 색이 없는 요청은 `color_filter: null`, `color_rejected: []`이고 결과는 전과 같습니다.
+- `targets`가 없거나 비어 있으면 `mode: "all"`: 기본 어휘 전체에서 찾되 배경 물체(table, desk, chair, person, window, door 등, vocab.py의 `BACKGROUND`)는 빼고 신뢰도 높은 순으로 최대 20개(`MAX_RESULTS_ALL`)를 돌려줍니다. 이때 `target`은 `label`과 같고 색상 필터는 쓰지 않습니다.
 
 ```json
 {
   "mode": "targets",
   "detections": [
-    {"label": "mug", "target": "cup", "score": 0.83, "box": {"x": 0.11, "y": 0.21, "w": 0.39, "h": 0.39}}
+    {"label": "mug", "target": "cup", "score": 0.79, "color_match": 0.82,
+     "box": {"x": 0.11, "y": 0.21, "w": 0.39, "h": 0.39}}
   ],
-  "timing_ms": {"decode": 3.1, "vocab_update": 0, "queue_wait": 12.4, "inference": 28.7, "total": 46.0},
+  "color_filter": "red",
+  "color_rejected": [{"label": "cup", "box": {"x": 0.6, "y": 0.3, "w": 0.2, "h": 0.3}, "dominant_color": "blue"}],
+  "timing_ms": {"decode": 3.1, "vocab_update": 0, "queue_wait": 12.4, "inference": 28.7, "color": 0.6, "total": 46.6},
   "batch_size": 6, "device": "cuda", "model": "yoloe-26l-seg.pt"
 }
 ```
@@ -160,7 +169,7 @@ curl -s -H "X-API-Key: $API_KEY" http://127.0.0.1:8000/stats | python3 -m json.t
 }
 ```
 
-`intent`는 find / where / how / stop / unknown이고 서버가 바꾸지 않습니다. `where`라도 문장에 물건 이름이 있으면 `object_ko`와 `targets`를 둘 다 채워서 돌려주므로, 앱은 `object_ko`를 지금 찾는 물건과 비교해 새 물건인지 판단하면 됩니다. 둘 중 하나만 채워져 오면 Gemini에 한 번 더 묻고, 그래도 같으면 받은 결과를 그대로 돌려줍니다. "이거 어떻게 잡아?"처럼 물건 이름이 없으면 `object_ko: null`, `targets: []`입니다. `targets`는 0~3개의 영어 소문자 이름으로 `/detect`의 `targets`에 그대로 넣을 수 있습니다. 같은 문장(공백과 끝의 ?·! 차이는 무시)은 메모리에 저장한 결과를 다시 쓰고(`cached: true`), 기기(`X-Client-Id`, 없으면 IP)별로 분당 20회까지 받습니다. CSV에는 음성 문장 대신 해석된 targets만 남깁니다.
+`intent`는 find / where / how / stop / unknown이고 서버가 바꾸지 않습니다. `where`라도 문장에 물건 이름이 있으면 `object_ko`와 `targets`를 둘 다 채워서 돌려주므로, 앱은 `object_ko`를 지금 찾는 물건과 비교해 새 물건인지 판단하면 됩니다. 둘 중 하나만 채워져 오면 Gemini에 한 번 더 묻고, 그래도 같으면 받은 결과를 그대로 돌려줍니다. "이거 어떻게 잡아?"처럼 물건 이름이 없으면 `object_ko: null`, `targets: []`입니다. `targets`는 0~3개의 영어 소문자 이름으로 `/detect`의 `targets`에 그대로 넣을 수 있습니다. 같은 문장(공백과 끝의 ?·! 차이는 무시)은 메모리에 저장한 결과를 다시 쓰고(`cached: true`), 기기(`X-Client-Id`, 없으면 IP)별로 분당 20회까지 받습니다. CSV에는 음성 문장 대신 해석된 targets만 남깁니다. 문장에 색 형용사(빨간, 까만, 은색, 분홍 등)가 있으면 targets 첫 번째가 `"red cup"`처럼 영어 색 단어 + 물건 이름이 되므로, 그대로 `/detect`에 넘기면 색상 필터가 적용됩니다. Gemini가 색을 빼먹으면 서버가 보충합니다.
 
 **POST /tts** (JSON): `{"text": "보드마카 찾아볼게요"}` → `audio/mpeg` (MP3)
 

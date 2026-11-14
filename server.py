@@ -101,6 +101,34 @@ SYNONYMS = env_bool("SYNONYMS", True)
 DEDUPE_IOU = env_float("DEDUPE_IOU", 0.6)  # 같은 물건이 cup/mug로 두 번 잡히면 하나만 남김
 MAX_IMAGE_BYTES = int(env_float("MAX_IMAGE_MB", 8) * 1024 * 1024)
 
+# ---- 색상 구분 (/detect 후처리) ---------------------------------------------
+# 요청 이름에 색상 단어가 있으면 박스 중앙 50% 영역의 HSV 픽셀 비율로 색을 검증한다.
+COLOR_MIN_RATIO = env_float("COLOR_MIN_RATIO", 0.30)  # 요청 색 픽셀이 이 비율 이상이어야 남김
+COLOR_SHAPE_ONLY = env_bool("COLOR_SHAPE_ONLY", True)  # YOLOE에는 색을 뺀 이름(예: tumbler)만 보내 형태로 찾기
+DOMINANT_MIN_RATIO = 0.20  # 가장 많은 색이 이보다 적으면 "unknown"
+COLOR_KEYWORDS = {"black", "white", "gray", "grey", "silver", "red", "orange", "yellow",
+                  "green", "blue", "purple", "pink", "brown"}
+COLOR_ALIASES = {"grey": "gray", "silver": "gray"}
+# OpenCV HSV 기준 (H 0~179, S·V 0~255). 색마다 (H최소, H최대, S최소, S최대, V최소, V최대) 범위 목록, 범위끼리는 OR
+COLOR_HSV_RULES: dict[str, list[tuple[int, int, int, int, int, int]]] = {
+    "black":  [(0, 179, 0, 255, 0, 59)],                                 # V < 60
+    "white":  [(0, 179, 0, 54, 181, 255)],                               # S < 55, V > 180
+    "gray":   [(0, 179, 0, 54, 60, 180)],                                # S < 55, 60 ≤ V ≤ 180
+    "red":    [(0, 10, 50, 255, 50, 255), (165, 179, 50, 255, 50, 255)],  # H ≤ 10 또는 H ≥ 165
+    "orange": [(11, 22, 50, 255, 50, 255)],
+    "yellow": [(23, 35, 50, 255, 50, 255)],
+    "green":  [(36, 85, 50, 255, 50, 255)],
+    "blue":   [(86, 130, 50, 255, 50, 255)],
+    "purple": [(131, 164, 50, 255, 50, 255)],
+    "pink":   [(0, 10, 30, 150, 150, 255), (150, 179, 30, 150, 150, 255)],  # 보라와 별도로 판별
+    "brown":  [(5, 25, 50, 255, 40, 160)],
+}
+# 분홍은 빨강·보라 기준과 겹치므로, 빨강·보라를 셀 때는 분홍 픽셀을 뺀다 (빨간 컵을 찾을 때 분홍 컵이 남지 않게)
+COLOR_EXCLUDE = {"red": ("pink",), "purple": ("pink",)}
+# 갈색↔주황·빨강처럼 겹치는 색은 비율이 거의 같을 때 더 구체적인 색을 고름 (dominant_color 에만 사용)
+COLOR_SPECIFIC_BONUS = {"pink": 0.05, "brown": 0.05}
+COLOR_SAMPLE_MAX_SIDE = 160  # 중앙 영역이 크면 이 크기로 줄여서 계산 (비율은 거의 같고 빠름)
+
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
 GEMINI_THINKING_LEVEL = os.getenv("GEMINI_THINKING_LEVEL", "minimal")  # 가장 낮은 추론 수준
@@ -363,6 +391,109 @@ def decode_image(data: bytes) -> np.ndarray:
     if img is None:
         raise ApiError(400, "invalid_image", "이미지를 읽을 수 없습니다. JPEG 파일을 보내주세요.")
     return img
+
+
+# ---------------------------------------------------------------------------
+# 색상 검증 (YOLOE 형태 탐지 → 박스 중앙 50% HSV 픽셀 비율로 색 확인)
+# ---------------------------------------------------------------------------
+def normalize_color(word: str) -> str | None:
+    w = word.lower()
+    if w not in COLOR_KEYWORDS:
+        return None
+    return COLOR_ALIASES.get(w, w)  # grey, silver → gray
+
+
+def extract_color_from_targets(targets: list[str]) -> str | None:
+    """["black tumbler", "tumbler"] → "black". 색상 단어가 없으면 None"""
+    for t in targets:
+        for word in re.split(r"[\s\-]+", t.lower()):
+            color = normalize_color(word)
+            if color:
+                return color
+    return None
+
+
+def strip_color_words(name: str) -> str:
+    """'black tumbler' → 'tumbler' (색만 있는 이름이면 그대로)"""
+    words = [w for w in name.split() if w.lower() not in COLOR_KEYWORDS]
+    return " ".join(words) or name
+
+
+def color_mask(hsv: np.ndarray, color: str) -> np.ndarray:
+    """HSV 이미지에서 해당 색 픽셀이면 255인 마스크"""
+    mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
+    for h1, h2, s1, s2, v1, v2 in COLOR_HSV_RULES[color]:
+        mask |= cv2.inRange(hsv, (h1, s1, v1), (h2, s2, v2))
+    return mask
+
+
+def match_mask(hsv: np.ndarray, color: str) -> np.ndarray:
+    """일치율 계산용 마스크: color_mask 에서 더 구체적인 색(COLOR_EXCLUDE) 픽셀을 뺀 것"""
+    mask = color_mask(hsv, color)
+    for other in COLOR_EXCLUDE.get(color, ()):
+        mask &= cv2.bitwise_not(color_mask(hsv, other))
+    return mask
+
+
+def _center_hsv(bgr_img: np.ndarray, box: dict) -> np.ndarray | None:
+    """정규화 박스(x, y, w, h)에서 상하좌우 25%씩 뺀 중앙 50% 영역을 HSV로. 비면 None"""
+    H, W = bgr_img.shape[:2]
+    x, y, w, h = box["x"], box["y"], box["w"], box["h"]
+    x1, x2 = int(round((x + 0.25 * w) * W)), int(round((x + 0.75 * w) * W))
+    y1, y2 = int(round((y + 0.25 * h) * H)), int(round((y + 0.75 * h) * H))
+    x1, x2 = max(0, min(W, x1)), max(0, min(W, x2))
+    y1, y2 = max(0, min(H, y1)), max(0, min(H, y2))
+    if x2 <= x1 or y2 <= y1:
+        return None
+    crop = bgr_img[y1:y2, x1:x2]
+    scale = COLOR_SAMPLE_MAX_SIDE / max(crop.shape[:2])
+    if scale < 1.0:
+        crop = cv2.resize(crop, (max(1, int(crop.shape[1] * scale)), max(1, int(crop.shape[0] * scale))),
+                          interpolation=cv2.INTER_AREA)
+    return cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+
+
+def compute_color_match_ratio(bgr_img: np.ndarray, box: dict, target_color: str) -> float:
+    """박스 중앙 50% 영역에서 target_color 픽셀 비율 (0.0~1.0). 영역이 비면 0.0"""
+    hsv = _center_hsv(bgr_img, box)
+    if hsv is None or hsv.size == 0:
+        return 0.0
+    return float(np.count_nonzero(match_mask(hsv, target_color))) / (hsv.shape[0] * hsv.shape[1])
+
+
+def color_ratios(bgr_img: np.ndarray, box: dict) -> dict[str, float]:
+    hsv = _center_hsv(bgr_img, box)
+    if hsv is None or hsv.size == 0:
+        return {}
+    n = hsv.shape[0] * hsv.shape[1]
+    return {c: float(np.count_nonzero(match_mask(hsv, c))) / n for c in COLOR_HSV_RULES}
+
+
+def dominant_color(bgr_img: np.ndarray, box: dict) -> str:
+    """중앙 50% 영역에서 비율이 가장 높은 색. 그 비율이 0.2 미만이면 "unknown" """
+    ratios = color_ratios(bgr_img, box)
+    if not ratios:
+        return "unknown"
+    best = max(ratios, key=lambda c: ratios[c] + COLOR_SPECIFIC_BONUS.get(c, 0.0))
+    return best if ratios[best] >= DOMINANT_MIN_RATIO else "unknown"
+
+
+def filter_detections_by_color(bgr_img: np.ndarray, detections: list[dict], targets: list[str]):
+    """요청 색과 맞는 박스만 남김. 반환: (남은 detections, rejected, 요청 색 또는 None)
+    색 요청이 없으면 detections 를 손대지 않고 그대로 돌려준다."""
+    color = extract_color_from_targets(targets)
+    if color is None:
+        return detections, [], None
+    kept: list[dict] = []
+    rejected: list[dict] = []
+    for d in detections:
+        ratio = compute_color_match_ratio(bgr_img, d["box"], color)
+        if ratio >= COLOR_MIN_RATIO:
+            kept.append({**d, "score": round(d["score"] * (0.6 + 0.4 * ratio), 4), "color_match": round(ratio, 3)})
+        elif len(rejected) < 5:
+            rejected.append({"label": d["label"], "box": d["box"], "dominant_color": dominant_color(bgr_img, d["box"])})
+    kept.sort(key=lambda d: d["score"], reverse=True)
+    return kept, rejected, color
 
 
 def iou(a: np.ndarray, b: np.ndarray) -> float:
@@ -803,8 +934,19 @@ targets: 물체 인식 모델에 넣을 영어 물체 이름
 - 영어 소문자, 단수형, 관사(a, the) 없이
 - 물리적인 물건이 아니면 (예: 날씨, 시간, 기분) 빈 배열
 
+색상 (서버가 사진 색으로 다시 확인하므로 색 단어를 절대 빼먹지 마)
+- 문장에 색상 형용사(빨간, 검은, 까만, 하얀, 흰, 파란, 노란, 초록, 회색, 은색, 주황, 보라, 분홍, 갈색 등)가 있으면
+  targets의 첫 번째는 반드시 "영어 색 단어 + 물건 이름", 두 번째는 색 없는 물건 이름
+- 영어 색 단어는 이 중에서만: black, white, gray, grey, silver, red, orange, yellow, green, blue, purple, pink, brown
+  (까만·검정 → black, 흰·하얀 → white, 은색 → silver, 분홍·핑크 → pink, 남색·하늘색 → blue, 베이지 → brown)
+- object_ko에도 색을 그대로 넣어 (예: "빨간 컵")
+
 예시
 "내 검은 텀블러 어디 있어?" → {"intent": "where", "object_ko": "검은 텀블러", "targets": ["black tumbler", "tumbler"]}
+"빨간 컵 찾아줘" → {"intent": "find", "object_ko": "빨간 컵", "targets": ["red cup", "cup"]}
+"분홍색 지갑 어디 있어?" → {"intent": "where", "object_ko": "분홍색 지갑", "targets": ["pink wallet", "wallet"]}
+"갈색 가방 찾아줘" → {"intent": "find", "object_ko": "갈색 가방", "targets": ["brown bag", "bag"]}
+"까만 리모컨 어디야?" → {"intent": "where", "object_ko": "까만 리모컨", "targets": ["black remote control", "remote control"]}
 "약통 좀 찾아줘" → {"intent": "find", "object_ko": "약통", "targets": ["pill bottle", "medicine bottle"]}
 "왼쪽에 있는 리모컨 찾아줘" → {"intent": "find", "object_ko": "리모컨", "targets": ["remote control"]}
 "이 컵 어떻게 잡아?" → {"intent": "how", "object_ko": "컵", "targets": ["cup"]}
@@ -885,6 +1027,33 @@ class ParseCache:
 parse_cache = ParseCache(PARSE_CACHE_SIZE)
 
 
+# 한국어 색 형용사 → 영어 색 단어 (Gemini가 targets에 색을 빼먹었을 때 서버가 보충)
+KO_COLOR_WORDS: list[tuple[str, str]] = [
+    ("빨간", "red"), ("빨강", "red"), ("붉은", "red"), ("검은", "black"), ("검정", "black"), ("까만", "black"),
+    ("까망", "black"), ("하얀", "white"), ("하양", "white"), ("흰", "white"), ("파란", "blue"), ("파랑", "blue"),
+    ("남색", "blue"), ("하늘색", "blue"), ("노란", "yellow"), ("노랑", "yellow"), ("초록", "green"), ("녹색", "green"),
+    ("연두", "green"), ("회색", "gray"), ("은색", "silver"), ("주황", "orange"), ("보라", "purple"),
+    ("분홍", "pink"), ("핑크", "pink"), ("갈색", "brown"), ("베이지", "brown"),
+]
+
+
+def ensure_color_in_targets(text: str, result: dict) -> dict:
+    """문장에 색 형용사가 있는데 targets에 색 단어가 없으면 첫 번째에 "색 + 물건"을 넣음.
+    targets 안의 색 단어가 목록 밖이면(예: navy) 그 이름은 그대로 두고 손대지 않는다."""
+    targets = result["targets"]
+    if not targets or extract_color_from_targets(targets):
+        return result
+    en = next((e for k, e in KO_COLOR_WORDS if k in text), None)
+    if en is None:
+        return result
+    base = strip_color_words(targets[0])
+    fixed = [f"{en} {base}"] + [t for t in targets if t != f"{en} {base}"]
+    if base not in fixed:
+        fixed.append(base)
+    log.info("/parse: 색 단어 보충 %s → %s", targets, fixed[:3])
+    return {**result, "targets": fixed[:3]}
+
+
 def parse_incomplete(result: dict) -> bool:
     """object_ko와 targets 중 하나만 채워진 경우 (물건이 있으면 둘 다 있어야 앱이 새 물건인지 판단 가능)"""
     return bool(result["object_ko"]) != bool(result["targets"])
@@ -901,6 +1070,7 @@ async def gemini_parse(text: str) -> tuple[dict, int]:
         if result is None:
             log.warning("/parse: Gemini 응답 형식이 맞지 않음 (시도 %d): %s", attempt, reply[:200])
             continue
+        result = ensure_color_in_targets(text, result)
         if not parse_incomplete(result):
             return result, attempt
         # 하나만 비어 있으면 짚어서 다시 물어봄. 두 번째도 그러면 받은 결과를 그대로 씀
@@ -908,7 +1078,7 @@ async def gemini_parse(text: str) -> tuple[dict, int]:
         fallback = result
         prompt = base + "\n\n주의: 물건 이름이 있으면 object_ko와 targets를 둘 다 채워. 물건이 없으면 둘 다 비워."
     if fallback is not None:
-        return fallback, 2
+        return ensure_color_in_targets(text, fallback), 2
     raise ApiError(502, "vlm_invalid_json", "Gemini 응답이 두 번 모두 올바른 JSON 형식이 아니었습니다.")
 
 
@@ -1157,11 +1327,19 @@ async def detect(
             raise ApiError(503, "queue_full", "요청이 많아 지금은 처리할 수 없습니다. 기기 내 인식을 사용하세요.")
 
         vocab_ms = 0.0
+        # 별칭·동의어로 바꾸기 전의 원래 요청 목록 (색상 단어를 잃지 않도록 색 검증에는 이것을 씀)
+        raw_targets = [" ".join(p.strip().lower().split()) for p in targets.split(",") if p.strip()]
+        req_color = extract_color_from_targets(raw_targets) if mode == "targets" else None
         if mode == "all":
-            # 기본 어휘는 항상 모델에 설정돼 있으므로 어휘 변경 없음
+            # 기본 어휘는 항상 모델에 설정돼 있으므로 어휘 변경 없음 (색 필터도 적용하지 않음)
             requested, label_to_target, max_results = ["*"], ALL_MODE_TARGETS, MAX_RESULTS_ALL
         else:
-            requested = parse_targets(targets, set(detector.name_to_id))
+            detect_names = targets
+            if req_color and COLOR_SHAPE_ONLY:
+                # YOLOE는 형태로만 찾고 색은 HSV로 확인: "black tumbler" → "tumbler"
+                # (색이 붙은 새 이름을 어휘에 추가하느라 모든 사용자의 추론이 멈추는 것도 막음)
+                detect_names = ",".join(strip_color_words(t) for t in raw_targets)
+            requested = parse_targets(detect_names, set(detector.name_to_id))
             label_to_target, max_results = expand_targets(requested), None
             if detector.missing_words(label_to_target):
                 vocab_ms = await run_in_threadpool(detector.ensure_words, list(label_to_target))
@@ -1181,22 +1359,34 @@ async def detect(
         except asyncio.TimeoutError:
             raise ApiError(503, "timeout", "처리 시간이 너무 길어졌습니다. 기기 내 인식을 사용하세요.")
 
+        # 추론·동의어·중복 박스 정리가 끝난 결과에 색 필터 (색 요청이 없으면 그대로 통과)
+        detections, color_rejected, color_filter, color_ms = out["detections"], [], None, 0.0
+        if req_color:
+            t1 = time.perf_counter()
+            detections, color_rejected, color_filter = await run_in_threadpool(
+                filter_detections_by_color, img, detections, raw_targets)  # img 는 cv2로 디코딩한 BGR
+            color_ms = ms(time.perf_counter() - t1)
+
         total = ms(time.perf_counter() - t_start)
         timing = {
             "decode": decode_ms,
             "vocab_update": vocab_ms,
             "queue_wait": out["queue_wait"],
             "inference": out["inference"],
+            "color": color_ms,
             "total": total,
         }
-        row.update(n_detections=len(out["detections"]), batch_size=out["batch_size"], imgsz=imgsz,
+        row.update(n_detections=len(detections), batch_size=out["batch_size"], imgsz=imgsz,
                    decode_ms=decode_ms, vocab_ms=vocab_ms, queue_wait_ms=out["queue_wait"],
                    inference_ms=out["inference"])
         record("detect", 200, "ok", t_start, ip, cid, **row)
-        log.debug("detect %s found=%d %s", requested, len(out["detections"]), timing)
+        log.debug("detect %s color=%s found=%d rejected=%d %s",
+                  requested, color_filter, len(detections), len(color_rejected), timing)
         return {
             "mode": mode,
-            "detections": out["detections"],
+            "detections": detections,
+            "color_filter": color_filter,
+            "color_rejected": color_rejected,
             "timing_ms": timing,
             "batch_size": out["batch_size"],
             "device": detector.device,

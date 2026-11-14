@@ -4,6 +4,7 @@
 사용 예
   python test_detect.py photo.jpg --targets "mug,cup"
   python test_detect.py photo.jpg --targets ""         # 전체 탐지 (배경 물체 제외, 최대 20개)
+  python test_detect.py photo.jpg --targets "red cup,cup"   # 색상 필터 (빨간 컵만)
   python test_detect.py photo.jpg --url https://xxxx.trycloudflare.com --key 내키 --repeat 5
   python test_detect.py cup_crop.jpg --describe       # /describe (Gemini 중계) 테스트
   (--key 를 생략하면 환경변수 API_KEY 사용)
@@ -77,15 +78,24 @@ def main() -> None:
         print(f"  mode={body.get('mode')} device={body['device']} model={body['model']}")
         print(f"  서버 시간(ms): {body['timing_ms']}  배치 크기: {body.get('batch_size')}")
         print(f"  네트워크 등 서버 밖 시간: {rtt - body['timing_ms']['total']:.1f} ms")
+        print(f"  color_filter={body.get('color_filter')}")
         if not body["detections"]:
             print("  찾은 물체 없음")
         for d in body["detections"]:
             b = d["box"]
             cx, cy = b["x"] + b["w"] / 2, b["y"] + b["h"] / 2
+            match = f"  color_match={d['color_match']:.2f}" if "color_match" in d else ""
             print(
-                f"  - {d['label']:<14} (요청: {d.get('target', d['label'])}) {d['score']:.2f}  "
+                f"  - {d['label']:<14} (요청: {d.get('target', d['label'])}) {d['score']:.2f}{match}  "
                 f"x={b['x']:.3f} y={b['y']:.3f} w={b['w']:.3f} h={b['h']:.3f}  (중심 {cx:.2f}, {cy:.2f})"
             )
+        rejected = body.get("color_rejected") or []
+        if rejected:
+            print(f"  색이 달라 제외 {len(rejected)}개:")
+            for d in rejected:
+                b = d["box"]
+                print(f"    x {d['label']:<14} dominant_color={d['dominant_color']:<8} "
+                      f"(중심 {b['x'] + b['w'] / 2:.2f}, {b['y'] + b['h'] / 2:.2f})")
 
     if len(rtts) > 1:
         warm = rtts[1:]

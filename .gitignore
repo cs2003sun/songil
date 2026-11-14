@@ -15,3 +15,6 @@ bus.jpg
 constraints.txt
 logs/
 static/audio/cache/
+.env.*
+!.env.example
+*.jpg

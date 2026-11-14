@@ -53,7 +53,7 @@ python3 -c "import secrets; print(secrets.token_urlsafe(32))"   # API_KEY 로 �
 nano .env        # API_KEY, GEMINI_API_KEY, ELEVENLABS_API_KEY, ELEVENLABS_VOICE_ID, (고정 주소면) TUNNEL_TOKEN
 ```
 
-prompt.txt 의 `{대상}`은 `/describe` 요청의 `target`(없으면 `DESCRIBE_DEFAULT_TARGET`, 기본 컵), `{대상을}`은 받침에 맞춰 "컵을"·"텀블러를"로 바뀝니다. `{현재시간}`은 요청 때마다 서버 시각(TIMEZONE, 기본 Asia/Seoul) 기준으로 바뀝니다: 5~11시 아침, 12~17시 오후, 그 밖은 저녁 (VLM 테스트 페이지와 같은 기준). `#`으로 시작하는 줄은 보내지 않고, 파일을 고치면 서버를 다시 켜지 않아도 다음 요청부터 반영됩니다.
+prompt.txt 의 `{대상}`은 `/describe` 요청의 `target`(없으면 `DESCRIBE_DEFAULT_TARGET`, 기본 "가운데 물건"), `{대상을}`은 받침에 맞춰 "컵을"·"텀블러를"로 바뀝니다. `{현재시간}`은 요청 때마다 서버 시각(TIMEZONE, 기본 Asia/Seoul) 기준으로 바뀝니다: 5~11시 아침, 12~17시 오후, 그 밖은 저녁 (VLM 테스트 페이지와 같은 기준). `#`으로 시작하는 줄은 보내지 않고, 파일을 고치면 서버를 다시 켜지 않아도 다음 요청부터 반영됩니다.
 
 프롬프트를 고쳐가며 시험하려면 브라우저에서 `https://주소/describe-test`를 여세요. 텍스트 상자에 prompt.txt 내용이 기본값으로 들어 있고, 고친 내용은 그 요청에만 쓰입니다 (prompt.txt는 바뀌지 않음). 사진 위 손잡이 점 표시, 문장 읽어주기, 빠진 항목·안심 표현 점검이 있습니다. 발표 때는 `.env`에서 `TEST_PAGE=0`으로 끌 수 있습니다.
 
@@ -68,7 +68,7 @@ prompt.txt 의 `{대상}`은 `/describe` 요청의 `target`(없으면 `DESCRIBE_
 | `ELEVENLABS_PREGEN_MODEL` | 미리 생성용, 기본 `eleven_v3` (가장 자연스럽고 감정 표현이 풍부, 느리고 비쌈) |
 | `ELEVENLABS_LIVE_MODEL` | 실시간 생성용, 기본 `eleven_flash_v2_5` (약 75ms, 한국어 지원, 글자당 비용 낮음) |
 | `ELEVENLABS_STABILITY` 등 4개 | 비우면 그 목소리의 기본값. `eleven_v3`는 안정성을 0.0/0.5/1.0 세 단계로만 받으므로 가장 가까운 값으로 맞춰 보냅니다 |
-| `TTS_DAILY_CHAR_LIMIT` | 실시간 생성 하루 글자 수 상한 (기본 5000, TIMEZONE 기준 자정에 초기화) |
+| `TTS_DAILY_CHAR_LIMIT` | 실시간 생성 하루 글자 수 상한 (서버 전체, 기본 30000. 동시 사용자 수에 맞춰 조정, TIMEZONE 기준 자정에 초기화) |
 
 요청은 ElevenLabs 공식 API(`POST /v1/text-to-speech/{voice_id}`, `xi-api-key` 헤더, `mp3_44100_128`)로 보내고, 한국어로 읽도록 `language_code: "ko"`를 함께 보냅니다.
 
@@ -151,6 +151,7 @@ curl -s -H "X-API-Key: $API_KEY" http://127.0.0.1:8000/stats | python3 -m json.t
   ],
   "color_filter": "red",
   "color_rejected": [{"label": "cup", "box": {"x": 0.6, "y": 0.3, "w": 0.2, "h": 0.3}, "dominant_color": "blue"}],
+  "vocab_pending": [],
   "timing_ms": {"decode": 3.1, "vocab_update": 0, "queue_wait": 12.4, "inference": 28.7, "color": 0.6, "total": 46.6},
   "batch_size": 6, "device": "cuda", "model": "yoloe-26l-seg.pt"
 }
@@ -158,11 +159,18 @@ curl -s -H "X-API-Key: $API_KEY" http://127.0.0.1:8000/stats | python3 -m json.t
 
 `label`은 모델이 인식한 어휘 이름, `target`은 그 결과가 어떤 요청 이름 때문에 포함됐는지입니다 (동의어 그룹: cup을 요청하면 mug·tumbler 등도 찾음). 같은 물건이 두 이름으로 겹쳐 잡히면(cup/mug처럼 같은 요청 이름이나 같은 동의어 그룹) 점수 높은 것 하나만 남깁니다. 다른 물건끼리는 많이 겹쳐도 지우지 않으므로, 앞의 컵이 뒤의 물병을 가려도 둘 다 나옵니다. `phone`→`cell phone`, `keys`→`key` 같은 별칭과 간단한 복수형은 자동으로 바꿉니다.
 
+**어휘에 없는 이름:** 어휘를 바꾸는 동안은 모든 사용자의 추론이 잠깐 멈추므로, 되도록 바꾸지 않습니다.
+- 이름의 뒷부분이 어휘에 있으면 그 이름으로 찾습니다 (`plastic water bottle` → `water bottle`, 어휘 변경 없음).
+- 그래도 없으면 요청은 기다리지 않고 바로 응답하고, 그 이름을 `vocab_pending`에 담아 돌려줍니다. 서버가 새 이름들을 모아 `VOCAB_UPDATE_INTERVAL`(5초)에 한 번씩 어휘에 추가하고, 추가된 뒤의 사진부터 찾습니다.
+- 어휘를 추가할 때 오래 걸리는 텍스트 임베딩 계산은 추론을 멈추지 않고 먼저 하고, 모든 추론이 멈추는 구간은 어휘 재설정(`set_classes`)과 예비 추론 한 번뿐입니다. 서버 로그의 `추론 멈춤: set_classes=…ms predictor 재준비=…ms`로 실제 시간을 확인할 수 있습니다.
+- 그 멈춘 시간은 `REQUEST_TIMEOUT`(1.5초) 계산에서 빼므로, 어휘 추가 때문에 다른 사용자의 사진이 503으로 버려지지 않습니다 (`VOCAB_STALL_EXEMPT=0`이면 예전처럼 포함).
+- `/health`의 `vocab_pending`은 추가를 기다리는 이름 수입니다. `/stats`의 `extra_words_top`은 기본 어휘 밖에서 자주 요청된 이름입니다. 자주 나오는 이름은 vocab.py의 기본 어휘에 넣으면 어휘 추가 자체가 없어집니다.
+
 **POST /describe** (multipart): `image`, `target`(선택, 설명할 물건 예: "검은 텀블러"), `prompt`(선택, 비우면 prompt.txt) → `{"result": {Gemini가 만든 JSON}, "safety_removed", "model", "attempts", "time_of_day", "target", "prompt_source", "custom_prompt_ignored", "timing_ms"}`
 
 - 기본 프롬프트의 결과에는 `hazard`(`hot`·`spill`·`edge`·`broken`·`sharp`·null)가 들어 있고, `safety`는 hazard가 있을 때만 채워집니다.
 - 서버가 어떤 프롬프트로 받은 결과든 `safety`를 한 번 더 거릅니다. hazard가 목록 밖이거나 없을 때, 일반 취급 주의(액정·화면·충전·떨어뜨리기 등)일 때, 안심시키는 말("뜨겁지 않아요" 등)일 때 `safety`를 null로 바꾸고 `safety_removed`에 이유(`no_hazard`·`generic_caution`·`reassuring`)를 적습니다. 앱이 `safety`가 있을 때만 경고를 띄운다면 앱을 고치지 않아도 경고 남발이 줄어듭니다.
-- `ALLOW_CUSTOM_PROMPT=0`이면 앱이 보낸 `prompt`는 무시하고 prompt.txt를 씁니다 (`custom_prompt_ignored: true`). `/describe-test` 페이지에서 보낸 것은 계속 허용합니다. 앱이 `target`만 보내도록 바뀐 뒤에 끄면 됩니다.
+- `ALLOW_CUSTOM_PROMPT=0`이면 앱이 보낸 `prompt`는 무시하고 prompt.txt를 씁니다 (`custom_prompt_ignored: true`). `/describe-test` 페이지에서 보낸 것은 계속 허용합니다. **끄기 전에 앱이 `/describe`에 `target`을 보내는지 먼저 확인하세요.** 보내지 않으면 모든 물건을 "가운데 물건"으로 질의합니다.
 
 **POST /parse** (JSON): `{"text": "내 검은 텀블러 어디 있어?"}` → 한국어 음성 명령을 Gemini로 해석
 
@@ -173,13 +181,13 @@ curl -s -H "X-API-Key: $API_KEY" http://127.0.0.1:8000/stats | python3 -m json.t
 }
 ```
 
-`intent`는 find / where / how / stop / unknown이고 서버가 바꾸지 않습니다. "잡았어", "잡았다", "이제 됐어", "고마워"도 `stop`이므로, 앱은 `stop`을 받으면 안내를 끝내면 됩니다. `where`라도 문장에 물건 이름이 있으면 `object_ko`와 `targets`를 둘 다 채워서 돌려주므로, 앱은 `object_ko`를 지금 찾는 물건과 비교해 새 물건인지 판단하면 됩니다. 둘 중 하나만 채워져 오면 Gemini에 한 번 더 묻고, 그래도 같으면 받은 결과를 그대로 돌려줍니다. "이거 어떻게 잡아?"처럼 물건 이름이 없으면 `object_ko: null`, `targets: []`입니다. `targets`는 0~3개의 영어 소문자 이름으로 `/detect`의 `targets`에 그대로 넣을 수 있습니다. 같은 문장(공백과 끝의 ?·! 차이는 무시)은 메모리에 저장한 결과를 다시 쓰고(`cached: true`), 기기(`X-Client-Id`, 없으면 IP)별로 분당 20회까지 받습니다. CSV에는 음성 문장 대신 해석된 targets만 남깁니다. 문장에 색 형용사(빨간, 까만, 은색, 분홍 등)가 있으면 targets 첫 번째가 `"red cup"`처럼 영어 색 단어 + 물건 이름이 되므로, 그대로 `/detect`에 넘기면 색상 필터가 적용됩니다. Gemini가 색을 빼먹으면 서버가 보충합니다.
+`intent`는 find / where / how / stop / unknown이고 서버가 바꾸지 않습니다. "잡았어", "잡았다", "이제 됐어", "고마워"도 `stop`이므로, 앱은 `stop`을 받으면 안내를 끝내면 됩니다. 그중 "컵 잡았어", "손에 잡혔어"처럼 물건을 쥐었다는 말이면 `grabbed: true`가 함께 오므로, 앱은 "안내를 멈췄어요" 대신 완료로 처리하면 됩니다. `where`라도 문장에 물건 이름이 있으면 `object_ko`와 `targets`를 둘 다 채워서 돌려주므로, 앱은 `object_ko`를 지금 찾는 물건과 비교해 새 물건인지 판단하면 됩니다. 둘 중 하나만 채워져 오면 Gemini에 한 번 더 묻고, 그래도 같으면 받은 결과를 그대로 돌려줍니다. "이거 어떻게 잡아?"처럼 물건 이름이 없으면 `object_ko: null`, `targets: []`입니다. `targets`는 0~3개의 영어 소문자 이름으로 `/detect`의 `targets`에 그대로 넣을 수 있습니다. Gemini 제한 시간은 시도당 `PARSE_TIMEOUT`(5초)이고, 시간 초과면 다시 시도하지 않고 바로 `504 vlm_timeout`을 돌려줍니다 (`/describe`는 `GEMINI_TIMEOUT` 20초). 같은 문장(공백과 끝의 ?·! 차이는 무시)은 메모리에 저장한 결과를 `PARSE_CACHE_TTL`(10분) 동안 다시 쓰고(`cached: true`), `unknown`이나 물건 이름이 빠진 결과는 저장하지 않습니다. 해석이 틀렸으면 `{"text": ..., "refresh": true}`로 보내 다시 해석할 수 있습니다. 기기(`X-Client-Id`, 없으면 IP)별로 분당 20회까지 받습니다. CSV에는 음성 문장 대신 해석된 targets만 남깁니다. 문장에 색 형용사(빨간, 까만, 은색, 분홍 등)가 있으면 targets 첫 번째가 `"red cup"`처럼 영어 색 단어 + 물건 이름이 되므로, 그대로 `/detect`에 넘기면 색상 필터가 적용됩니다. Gemini가 색을 빼먹으면 서버가 보충합니다.
 
 **POST /tts** (JSON): `{"text": "보드마카 찾아볼게요"}` → `audio/mpeg` (MP3)
 
 - 실시간 모델(`ELEVENLABS_LIVE_MODEL`)로 만들고, 같은 문장·목소리·모델·음성 설정이면 `static/audio/cache/{해시}.mp3`에 저장한 파일을 다시 씁니다 (앞뒤·연속 공백은 무시).
-- 응답 헤더: `X-TTS-Source`(`cache` 또는 `generated`), `X-TTS-Ms`(생성에 걸린 ms, 캐시는 0)
-- 기기(`X-Client-Id`, 없으면 IP)별 분당 30회, 200자 초과는 `400 text_too_long`
+- 응답 헤더: `X-TTS-Source`(`cache` 또는 `generated`), `X-TTS-Ms`(생성에 걸린 ms, 캐시는 0), `X-TTS-Url`(같은 음성의 GET 주소 `/app/audio/cache/{해시}.mp3`). 앱은 이 주소를 문장별로 저장해 두면 다음부터 `/tts`를 부르지 않고 브라우저 캐시로 바로 재생할 수 있습니다. 이 캐시 파일들은 `Cache-Control: public, max-age=31536000, immutable`로 제공됩니다 (파일 이름이 문장·목소리·모델·설정의 해시라 내용이 바뀌지 않음).
+- 기기(`X-Client-Id`, 없으면 IP)별 분당 60회(`TTS_RATE_PER_MIN`)는 **새로 생성할 때만** 셉니다. 저장된 문장은 몇 번을 요청해도 제한에 걸리지 않습니다. 200자 초과는 `400 text_too_long`
 - 하루 생성 글자 수가 `TTS_DAILY_CHAR_LIMIT`를 넘으면 `429 tts_daily_limit` (`Retry-After`는 자정까지 남은 초). 캐시된 문장은 계속 나갑니다. 사용량은 `logs/tts_usage.json`에 남아 서버를 다시 켜도 유지됩니다.
 - ElevenLabs 쪽 문제(키 오류, 설정 값 오류, 8초 시간 초과, 크레딧 부족 등)는 `502`와 이유를 JSON으로 돌려줍니다. 앱은 200이 아니면 브라우저 음성(speechSynthesis)으로 대체하면 됩니다.
 - 같은 문장이 동시에 여러 번 오면 ElevenLabs는 한 번만 부릅니다. 호출은 비동기라 그동안 `/detect`는 그대로 처리됩니다.
@@ -204,7 +212,7 @@ async function speak(text) {
 
 **GET /health**: `status`, `model_loaded`, `model`, `device`, `half`, `vocab_size`, `queue_length`, `describe_enabled`, `tts_enabled`(ElevenLabs 설정 여부), `tts_today_chars`(오늘 실시간 생성 글자 수), `tts_daily_limit`
 
-**GET /stats**: 최근 5분 `detect`/`describe`/`parse`/`tts`별 요청 수·성공 수·avg/p50/p95(ms)·429·503 횟수, `batch.avg_size`, `unique_ips`, `unique_clients`, `queue_length`
+**GET /stats**: 최근 5분 `detect`/`describe`/`parse`/`tts`별 요청 수·성공 수·avg/p50/p95(ms)·429·503 횟수, `batch.avg_size`, `unique_ips`, `unique_clients`, `queue_length`, `extra_words_top`(기본 어휘 밖에서 자주 요청된 이름), `vocab_stall_ms_total`(어휘 추가로 추론이 멈춘 누적 시간)
 
 | 상태 | code | 상황 |
 |---|---|---|
@@ -213,5 +221,6 @@ async function speak(text) {
 | 429 | `rate_limited`, `tts_daily_limit` | /detect 초당 5회, /describe 분당 10회, /parse 분당 20회, /tts 분당 30회 초과 / 오늘 음성 생성 한도 초과 (`Retry-After` 헤더) |
 | 502/504 | `vlm_error`, `vlm_invalid_json`, `vlm_timeout` 등 | Gemini 쪽 문제 |
 | 502 | `tts_error`, `tts_timeout`, `tts_unreachable`, `tts_bad_audio` | ElevenLabs 쪽 문제 → 앱은 브라우저 음성으로 대체 |
-| 503 | `queue_full`, `timeout`, `model_loading` | 대기열이 가득 참 / 오래 기다린 사진 버림 / 준비 중 → 폰은 기기 내 인식으로 전환 |
+| 503 | `queue_full`, `timeout` | 잠깐 혼잡해서 이번 사진만 처리 못 함. `Retry-After: 1`이 붙으므로 앱은 다음 사진을 그대로 보내면 됨 (여러 번 연속 실패할 때만 기기 내 인식으로 전환 권장) |
+| 503 | `model_loading` | 서버 시작 직후 모델 준비 중 |
 | 503 | `tts_disabled` | ElevenLabs 키·목소리 ID가 없거나 음성 설정 값이 숫자가 아님 |

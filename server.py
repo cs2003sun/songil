@@ -32,7 +32,7 @@ import re
 import secrets
 import threading
 import time
-from collections import OrderedDict, defaultdict, deque
+from collections import Counter, OrderedDict, defaultdict, deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -91,11 +91,15 @@ DETECT_RATE_PER_SEC = env_int("DETECT_RATE_PER_SEC", 5)
 DESCRIBE_RATE_PER_MIN = env_int("DESCRIBE_RATE_PER_MIN", 10)
 PARSE_RATE_PER_MIN = env_int("PARSE_RATE_PER_MIN", 20)  # /parse: 기기(X-Client-Id)별, 없으면 IP별
 PARSE_CACHE_SIZE = env_int("PARSE_CACHE_SIZE", 2000)  # 같은 문장 결과를 메모리에 저장하는 최대 개수
+PARSE_CACHE_TTL = env_float("PARSE_CACHE_TTL", 600)  # 저장한 해석 결과를 다시 쓰는 시간(초). 지나면 다시 해석
 PARSE_MAX_CHARS = env_int("PARSE_MAX_CHARS", 200)
 RATE_LIMIT_BY = os.getenv("RATE_LIMIT_BY", "ip+client")  # "ip" 또는 "ip+client" (X-Client-Id 헤더가 있으면 함께 사용)
 
 MAX_TARGETS = env_int("MAX_TARGETS", 10)
 MAX_RESULTS_ALL = env_int("MAX_RESULTS_ALL", 20)  # targets 없이 전체 탐지할 때 최대 결과 수
+VOCAB_UPDATE_INTERVAL = env_float("VOCAB_UPDATE_INTERVAL", 5.0)  # 새 단어 어휘 추가는 최소 이 간격(초)으로 모아서 한 번에
+# 어휘 재설정 때문에 모든 추론이 멈춘 시간은 REQUEST_TIMEOUT 계산에서 뺌 (그 때문에 사진이 버려지지 않게)
+VOCAB_STALL_EXEMPT = env_bool("VOCAB_STALL_EXEMPT", True)
 MAX_EXTRA_VOCAB = env_int("MAX_EXTRA_VOCAB", 100)  # 요청으로 추가되는 단어 최대 개수 (넘으면 오래 안 쓴 것부터 제거)
 SYNONYMS = env_bool("SYNONYMS", True)
 DEDUPE_IOU = env_float("DEDUPE_IOU", 0.6)  # 같은 물건이 cup/mug로 두 번 잡히면 하나만 남김 (같은 이름 그룹끼리만)
@@ -132,7 +136,8 @@ COLOR_SAMPLE_MAX_SIDE = 160  # 중앙 영역이 크면 이 크기로 줄여서 �
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
 GEMINI_THINKING_LEVEL = os.getenv("GEMINI_THINKING_LEVEL", "minimal")  # 가장 낮은 추론 수준
-GEMINI_TIMEOUT = env_float("GEMINI_TIMEOUT", 20)
+GEMINI_TIMEOUT = env_float("GEMINI_TIMEOUT", 20)  # /describe (사진 설명) 시도당 제한 시간
+PARSE_TIMEOUT = env_float("PARSE_TIMEOUT", 5)  # /parse (음성 명령) 시도당 제한 시간. 사용자가 답을 기다리는 구간이라 짧게
 DESCRIBE_MAX_SIDE = env_int("DESCRIBE_MAX_SIDE", 1024)  # 큰 이미지는 줄여서 전송
 PROMPT_FILE = os.getenv("PROMPT_FILE", "prompt.txt")
 TIMEZONE = os.getenv("TIMEZONE", "Asia/Seoul")
@@ -158,6 +163,10 @@ class ApiError(Exception):
         self.code = code
         self.message = message
         self.headers = headers
+
+
+# 일시적인 혼잡(503)은 곧 풀린다는 표시. 앱은 한 번 실패로 기기 내 인식으로 바꾸지 말고 다음 사진을 보내면 됨
+RETRY_SOON = {"Retry-After": "1"}
 
 
 def ms(seconds: float) -> float:
@@ -369,6 +378,17 @@ def parse_targets(raw: str, known: set[str]) -> list[str]:
 ALL_MODE_TARGETS: dict[str, str] = {w: w for w in BASE_VOCAB if w not in BACKGROUND}
 
 
+def vocab_fallback(name: str, known) -> str | None:
+    """어휘에 없는 이름의 뒷부분이 어휘에 있으면 그 이름 (예: plastic water bottle → water bottle).
+    모든 사용자의 추론을 멈추는 어휘 추가를 피하기 위해 쓴다."""
+    words = name.split()
+    for i in range(1, len(words)):
+        tail = " ".join(words[i:])
+        if tail in known:
+            return tail
+    return None
+
+
 def expand_targets(requested: list[str]) -> dict[str, str]:
     """찾을 어휘 이름 → 사용자가 요청한 이름. 동의어 그룹이 켜져 있으면 같은 그룹 이름도 포함"""
     mapping: dict[str, str] = {}
@@ -518,6 +538,7 @@ class Job:
     loop: asyncio.AbstractEventLoop
     max_results: int | None = None  # 전체 탐지 모드에서만 개수 제한
     mode: str = "targets"  # "targets" 또는 "all"
+    stall_at_enqueue: float = 0.0  # 대기열에 들어올 때까지 누적된 어휘 재설정 멈춤 시간 (submit 에서 기록)
 
 
 class Detector:
@@ -537,6 +558,16 @@ class Detector:
         self.extra_lock = threading.Lock()
         self.pe_cache: dict[str, Any] = {}  # 단어 → 텍스트 임베딩 (1, 1, D)
         self._text_model = None
+
+        # 어휘 추가 대기 (요청을 기다리게 하지 않고 백그라운드에서 모아서 추가)
+        self.pending_words: set[str] = set()
+        self._vocab_req_lock = threading.Lock()
+        self._vocab_event = threading.Event()
+        self._last_vocab_update = 0.0
+        self._encode_lock = threading.Lock()  # 텍스트 임베딩 계산은 추론 잠금(model_lock) 밖에서, 한 번에 하나씩
+        self._stall_total = 0.0  # 어휘 재설정으로 추론이 멈춘 누적 시간(초)
+        self._stall_started: float | None = None
+        self.word_requests: Counter = Counter()  # 기본 어휘 밖 단어의 요청 횟수 (기본 어휘에 넣을 후보)
 
         self.q: queue.Queue[Job] = queue.Queue()
         self._pending = 0
@@ -573,6 +604,7 @@ class Detector:
                 t3 = time.perf_counter()
 
             threading.Thread(target=self._worker, name="batch-worker", daemon=True).start()
+            threading.Thread(target=self._vocab_worker, name="vocab-worker", daemon=True).start()
             self.ready = True
             log.info(
                 "모델 준비 완료: 어휘 %d개 | load=%.0fms vocab=%.0fms warmup=%.0fms(%s)",
@@ -599,18 +631,25 @@ class Detector:
                     delattr(inner, "clip_model")
         return pe.to(self.device)
 
+    def _prepare_embeddings(self, names: list[str]) -> int:
+        """캐시에 없는 이름의 텍스트 임베딩만 계산해 저장. 반환: 새로 계산한 개수.
+        추론 잠금 밖에서 불러도 된다 (모델 가중치를 읽기만 하고, 어휘·predictor 는 바꾸지 않음)."""
+        with self._encode_lock:
+            missing = [n for n in names if n not in self.pe_cache]
+            if missing:
+                pe = self._encode_text(missing)
+                for i, n in enumerate(missing):
+                    self.pe_cache[n] = pe[:, i : i + 1, :]
+            return len(missing)
+
     def _apply_vocab(self, names: list[str]) -> int:
         """어휘 전체를 set_classes() 로 설정. 반환: 새로 계산한 임베딩 수 (model_lock 안에서 호출)"""
-        missing = [n for n in names if n not in self.pe_cache]
-        if missing:
-            pe = self._encode_text(missing)
-            for i, n in enumerate(missing):
-                self.pe_cache[n] = pe[:, i : i + 1, :]
+        missing = self._prepare_embeddings(names)  # 보통은 ensure_words 가 미리 계산해 두어 0
         embeddings = torch.cat([self.pe_cache[n] for n in names], dim=1)
         self.model.set_classes(list(names), embeddings)
         self.vocab = list(names)
         self.name_to_id = {n: i for i, n in enumerate(names)}
-        return len(missing)
+        return missing
 
     def _predict(self, imgs: list[np.ndarray], conf: float, imgsz: int, classes: list[int] | None = None):
         return self.model.predict(
@@ -629,12 +668,26 @@ class Detector:
         known = self.name_to_id
         return [w for w in words if w not in known]
 
+    def stall_clock(self) -> float:
+        """어휘 재설정으로 추론이 멈춘 누적 시간(초, 진행 중인 것 포함)"""
+        started = self._stall_started
+        return self._stall_total + (time.perf_counter() - started if started is not None else 0.0)
+
     def ensure_words(self, words: list[str]) -> float:
-        """어휘에 없는 단어를 추가하고 set_classes() 재설정. 이때만 추론을 잠시 멈춘다. 반환: 걸린 시간(ms)"""
+        """어휘에 없는 단어를 추가하고 set_classes() 재설정. 반환: 걸린 시간(ms)
+        시간이 걸리는 텍스트 임베딩 계산은 잠금 밖에서 먼저 하고, 추론을 멈추는 구간은 재설정과 예비 추론뿐이다."""
         t0 = time.perf_counter()
+        missing = self.missing_words(words)
+        if not missing:
+            return 0.0
+        n_pre = self._prepare_embeddings(missing)  # 이 동안 다른 사용자의 추론은 계속됨
+        t_enc = time.perf_counter()
         with self.model_lock:
+            self._stall_started = time.perf_counter()
             missing = self.missing_words(words)
             if not missing:
+                self._stall_total += time.perf_counter() - self._stall_started
+                self._stall_started = None
                 return ms(time.perf_counter() - t0)
             with self.extra_lock:
                 for w in missing:
@@ -646,24 +699,62 @@ class Detector:
                         break
                     del self.extra_vocab[old]
                 extras = [w for w in self.extra_vocab if w not in BASE_VOCAB]
-            n_new = self._apply_vocab(list(BASE_VOCAB) + extras)
+            n_new = n_pre + self._apply_vocab(list(BASE_VOCAB) + extras)
             t1 = time.perf_counter()
             # set_classes()가 predictor를 초기화하므로 여기서 미리 한 번 추론해 다시 준비시킴
-            self._predict([np.full((480, 640, 3), 114, dtype=np.uint8)], conf=DEFAULT_CONF, imgsz=DEFAULT_IMGSZ)
-            t2 = time.perf_counter()
+            try:
+                self._predict([np.full((480, 640, 3), 114, dtype=np.uint8)], conf=DEFAULT_CONF, imgsz=DEFAULT_IMGSZ)
+            finally:
+                t2 = time.perf_counter()
+                self._stall_total += t2 - self._stall_started
+                self._stall_started = None
         log.info(
-            "어휘 추가 %s → 총 %d개 (새 임베딩 %d) | set_classes=%.0fms predictor 재준비=%.0fms",
-            missing, len(self.vocab), n_new, ms(t1 - t0), ms(t2 - t1),
+            "어휘 추가 %s → 총 %d개 (새 임베딩 %d) | 임베딩(추론 계속)=%.0fms | 추론 멈춤: set_classes=%.0fms predictor 재준비=%.0fms",
+            missing, len(self.vocab), n_new, ms(t_enc - t0), ms(t1 - t_enc), ms(t2 - t1),
         )
         return ms(time.perf_counter() - t0)
+
+    def request_words(self, words: list[str]) -> None:
+        """어휘 추가 예약. 요청은 기다리지 않고, 다음 사진부터 새 단어로 찾을 수 있다."""
+        with self._vocab_req_lock:
+            self.pending_words.update(words)
+        self._vocab_event.set()
+
+    def _vocab_worker(self) -> None:
+        """예약된 단어를 VOCAB_UPDATE_INTERVAL 간격으로 모아서 한 번에 추가.
+        어휘 추가 동안은 모든 사용자의 추론이 잠깐 멈추므로, 횟수를 줄이는 것이 목적."""
+        while True:
+            self._vocab_event.wait()
+            wait = self._last_vocab_update + VOCAB_UPDATE_INTERVAL - time.monotonic()
+            if wait > 0:
+                time.sleep(wait)  # 그동안 들어온 단어도 함께 추가됨
+            with self._vocab_req_lock:
+                words = list(self.pending_words)
+                self.pending_words.clear()
+                self._vocab_event.clear()
+            try:
+                if self.missing_words(words):
+                    self.ensure_words(words)
+            except Exception:
+                log.exception("어휘 추가 실패: %s", words)
+            self._last_vocab_update = time.monotonic()
 
     # ---- 대기열 -----------------------------------------------------------
     def submit(self, job: Job) -> None:
         with self._pending_lock:
             if self._pending >= MAX_QUEUE:
-                raise ApiError(503, "queue_full", "요청이 많아 지금은 처리할 수 없습니다. 기기 내 인식을 사용하세요.")
+                raise ApiError(503, "queue_full", "요청이 많아 이번 사진은 처리하지 못했습니다. 잠시 후 다시 보내 주세요.",
+                               headers=RETRY_SOON)
             self._pending += 1
+        job.stall_at_enqueue = self.stall_clock()
         self.q.put(job)
+
+    def _waited(self, job: Job, now: float) -> float:
+        """대기 시간. VOCAB_STALL_EXEMPT 면 어휘 재설정으로 멈춘 시간은 뺌"""
+        waited = now - job.t_enqueue
+        if VOCAB_STALL_EXEMPT:
+            waited -= self.stall_clock() - job.stall_at_enqueue
+        return waited
 
     def _finish(self, job: Job, result: Any = None, error: Exception | None = None) -> None:
         with self._pending_lock:
@@ -704,8 +795,9 @@ class Detector:
         for j in batch:
             if j.future.cancelled():
                 self._finish(j)
-            elif t_start - j.t_enqueue > REQUEST_TIMEOUT:
-                self._finish(j, error=ApiError(503, "timeout", "대기 시간이 길어 오래된 사진을 버렸습니다. 기기 내 인식을 사용하세요."))
+            elif self._waited(j, t_start) > REQUEST_TIMEOUT:
+                self._finish(j, error=ApiError(503, "timeout", "대기 시간이 길어 오래된 사진을 버렸습니다. 다음 사진을 보내 주세요.",
+                                               headers=RETRY_SOON))
             else:
                 live.append(j)
         if not live:
@@ -805,7 +897,7 @@ MAX_PROMPT_CHARS = env_int("MAX_PROMPT_CHARS", 4000)
 TEST_PAGE = env_bool("TEST_PAGE", True)  # GET /describe-test 페이지 제공 여부
 # 0이면 앱이 보낸 prompt 를 무시하고 prompt.txt 사용 (테스트 페이지에서 보낸 것만 허용)
 ALLOW_CUSTOM_PROMPT = env_bool("ALLOW_CUSTOM_PROMPT", True)
-DESCRIBE_DEFAULT_TARGET = os.getenv("DESCRIBE_DEFAULT_TARGET", "컵")  # target 을 안 보내면 이 물건으로
+DESCRIBE_DEFAULT_TARGET = os.getenv("DESCRIBE_DEFAULT_TARGET", "가운데 물건")  # target 을 안 보내면 이 물건으로
 TEST_PAGE_CLIENT_ID = "describe-test-page"
 
 # ---- /describe 주의 문장(safety) 필터: 어떤 프롬프트로 받은 결과에도 적용 ----
@@ -931,8 +1023,10 @@ def parse_json_text(text: str) -> Any | None:
     return None
 
 
-async def call_gemini(jpeg: bytes | None, prompt: str) -> str:
-    """Gemini 호출. jpeg 가 None 이면 텍스트만 보낸다 (/parse)."""
+async def call_gemini(jpeg: bytes | None, prompt: str, timeout: float | None = None) -> str:
+    """Gemini 호출. jpeg 가 None 이면 텍스트만 보낸다 (/parse). timeout 을 안 주면 GEMINI_TIMEOUT.
+    시간 초과는 다시 시도하지 않고 바로 504."""
+    timeout = timeout or GEMINI_TIMEOUT
     global _thinking_supported
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
     gen_cfg: dict[str, Any] = {"responseMimeType": "application/json"}
@@ -948,9 +1042,9 @@ async def call_gemini(jpeg: bytes | None, prompt: str) -> str:
         "generationConfig": gen_cfg,
     }
     try:
-        r = await _http.post(url, headers={"x-goog-api-key": GEMINI_API_KEY}, json=body)
+        r = await _http.post(url, headers={"x-goog-api-key": GEMINI_API_KEY}, json=body, timeout=timeout)
     except httpx.TimeoutException:
-        raise ApiError(504, "vlm_timeout", f"Gemini 응답이 {GEMINI_TIMEOUT:.0f}초 안에 오지 않았습니다.")
+        raise ApiError(504, "vlm_timeout", f"Gemini 응답이 {timeout:g}초 안에 오지 않았습니다.")
     except httpx.HTTPError as e:
         raise ApiError(502, "vlm_unreachable", f"Gemini 연결 실패: {type(e).__name__}")
 
@@ -958,7 +1052,7 @@ async def call_gemini(jpeg: bytes | None, prompt: str) -> str:
         # 모델이 이 추론 수준을 지원하지 않으면 설정 없이 다시 (이후 요청도 생략)
         log.warning("Gemini가 thinkingLevel=%s 를 거부해 설정 없이 다시 요청합니다: %s", GEMINI_THINKING_LEVEL, r.text[:200])
         _thinking_supported = False
-        return await call_gemini(jpeg, prompt)
+        return await call_gemini(jpeg, prompt, timeout)
     if r.status_code != 200:
         try:
             msg = r.json().get("error", {}).get("message", "")
@@ -1043,6 +1137,11 @@ _RELATION_WORDS = {"my", "mine", "your", "his", "her", "our", "their", "the", "a
 
 class ParseRequest(BaseModel):
     text: str = Field(..., min_length=1, description="사용자의 한국어 음성 명령")
+    refresh: bool = Field(False, description="true 면 저장된 해석을 쓰지 않고 다시 해석 (이전 해석이 틀렸을 때)")
+
+
+# "컵 잡았어", "손에 잡혔어" 처럼 물건을 손에 쥐었다는 말 (stop 중에서 안내 완료와 그냥 멈춤을 구분)
+GRAB_RE = re.compile(r"잡았|잡혔|쥐었|집었|손에 들었|손에 있")
 
 
 def normalize_command(text: str) -> str:
@@ -1077,6 +1176,15 @@ def clean_parse_result(raw: Any) -> dict | None:
     return {"intent": intent, "object_ko": obj, "targets": targets}
 
 
+def parse_cacheable(result: dict) -> bool:
+    """unknown, 또는 물건을 찾는데 targets 가 비었거나 object_ko 와 targets 중 하나만 있는 결과는 저장 안 함"""
+    if result["intent"] == "unknown":
+        return False
+    if result["intent"] in ("find", "where") and not result["targets"]:
+        return False
+    return bool(result["object_ko"]) == bool(result["targets"])
+
+
 class ParseCache:
     """같은 문장의 해석 결과를 메모리에 저장 (오래 안 쓴 것부터 삭제).
     같은 문장이 동시에 들어오면 Gemini는 한 번만 부르고 결과를 나눠 쓴다."""
@@ -1089,14 +1197,21 @@ class ParseCache:
         self.misses = 0
 
     def get(self, key: str) -> dict | None:
-        v = self.data.get(key)
-        if v is not None:
-            self.data.move_to_end(key)
-            self.hits += 1
-        return v
+        item = self.data.get(key)
+        if item is None:
+            return None
+        value, saved_at = item
+        if time.monotonic() - saved_at > PARSE_CACHE_TTL:  # 오래된 해석은 버리고 다시 물음
+            del self.data[key]
+            return None
+        self.data.move_to_end(key)
+        self.hits += 1
+        return value
 
     def put(self, key: str, value: dict) -> None:
-        self.data[key] = value
+        if not parse_cacheable(value):  # 잘못됐을 가능성이 큰 결과는 저장하지 않음 (다시 말하면 다시 해석)
+            return
+        self.data[key] = (value, time.monotonic())
         self.data.move_to_end(key)
         while len(self.data) > self.size:
             self.data.popitem(last=False)
@@ -1143,7 +1258,7 @@ async def gemini_parse(text: str) -> tuple[dict, int]:
     base = PARSE_PROMPT.replace("{text}", json.dumps(text, ensure_ascii=False))
     prompt, fallback = base, None
     for attempt in (1, 2):
-        reply = await call_gemini(None, prompt)
+        reply = await call_gemini(None, prompt, PARSE_TIMEOUT)  # 시간 초과(504)면 재시도 없이 바로 끝남
         result = clean_parse_result(parse_json_text(reply))
         if result is None:
             log.warning("/parse: Gemini 응답 형식이 맞지 않음 (시도 %d): %s", attempt, reply[:200])
@@ -1165,8 +1280,8 @@ async def gemini_parse(text: str) -> tuple[dict, int]:
 # ---------------------------------------------------------------------------
 TTS_TIMEOUT = env_float("TTS_TIMEOUT", 8)  # ElevenLabs 응답 제한 시간(초)
 TTS_MAX_CHARS = env_int("TTS_MAX_CHARS", 200)
-TTS_RATE_PER_MIN = env_int("TTS_RATE_PER_MIN", 30)  # 기기(X-Client-Id)별, 없으면 IP별
-TTS_DAILY_CHAR_LIMIT = env_int("TTS_DAILY_CHAR_LIMIT", 5000)  # 실시간 생성 하루 글자 수 상한
+TTS_RATE_PER_MIN = env_int("TTS_RATE_PER_MIN", 60)  # 새로 생성할 때만, 기기(X-Client-Id)별, 없으면 IP별
+TTS_DAILY_CHAR_LIMIT = env_int("TTS_DAILY_CHAR_LIMIT", 30000)  # 실시간 생성 하루 글자 수 상한 (서버 전체)
 TTS_CACHE_DIR = STATIC_DIR / "audio" / "cache"  # /app/audio/cache/{해시}.mp3 로도 열림
 
 try:
@@ -1246,8 +1361,11 @@ class TTSUsage:
 tts_usage = TTSUsage(LOG_DIR / "tts_usage.json", TTS_DAILY_CHAR_LIMIT, TIMEZONE)
 
 
-def tts_audio_response(audio: bytes | Path, source: str, gen_ms: float) -> Response:
+def tts_audio_response(audio: bytes | Path, source: str, gen_ms: float, key: str) -> Response:
     headers = {"X-TTS-Source": source, "X-TTS-Ms": f"{gen_ms:.0f}", "Cache-Control": "no-store"}
+    if (TTS_CACHE_DIR / f"{key}.mp3").is_file():
+        # 같은 음성을 GET 주소로 다시 받을 수 있음 (브라우저 캐시 사용, 요청 제한·API 키 없음)
+        headers["X-TTS-Url"] = f"/app/audio/cache/{key}.mp3"
     if isinstance(audio, Path):
         return FileResponse(audio, media_type="audio/mpeg", headers=headers)
     return Response(content=audio, media_type="audio/mpeg", headers=headers)
@@ -1293,7 +1411,7 @@ app.add_middleware(
     allow_credentials="*" not in ALLOWED_ORIGINS,
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["X-API-Key", "X-Client-Id", "Content-Type"],
-    expose_headers=["X-TTS-Source", "X-TTS-Ms", "Retry-After"],
+    expose_headers=["X-TTS-Source", "X-TTS-Ms", "X-TTS-Url", "Retry-After"],
 )
 
 
@@ -1307,8 +1425,20 @@ async def app_root_redirect(request: Request):
     return RedirectResponse(url="/app/" + (f"?{query}" if query else ""), status_code=307)
 
 
+class AppStaticFiles(StaticFiles):
+    """/app 정적 파일. /tts 캐시 음성(audio/cache/{해시}.mp3)은 내용이 바뀌지 않으므로 브라우저가 오래 캐시하게 함
+    (파일 이름이 문장·목소리·모델·설정의 해시라, 무엇이든 바뀌면 다른 이름이 됨)"""
+
+    def file_response(self, full_path, stat_result, scope, status_code: int = 200) -> Response:
+        response = super().file_response(full_path, stat_result, scope, status_code)
+        p = Path(full_path)
+        if p.suffix == ".mp3" and p.parent.name == "cache" and p.parent.parent.name == "audio":
+            response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+        return response
+
+
 # html=True: /app/ 처럼 폴더 경로로 들어오면 index.html 을 보여줌
-app.mount("/app", StaticFiles(directory=STATIC_DIR, html=True, check_dir=False), name="app")
+app.mount("/app", AppStaticFiles(directory=STATIC_DIR, html=True, check_dir=False), name="app")
 
 
 def error_json(status: int, code: str, message: str, detail: Any = None, headers: dict | None = None) -> JSONResponse:
@@ -1357,6 +1487,7 @@ async def health():
         "device": detector.device,
         "half": detector.half,
         "vocab_size": len(detector.vocab),
+        "vocab_pending": len(detector.pending_words),
         "queue_length": detector.pending,
         "max_queue": MAX_QUEUE,
         "describe_enabled": bool(GEMINI_API_KEY and default_prompt()),
@@ -1374,6 +1505,9 @@ async def get_stats():
     s = stats.snapshot()
     s["queue_length"] = detector.pending
     s["vocab_size"] = len(detector.vocab)
+    # 기본 어휘 밖에서 자주 요청된 단어 (vocab.py 의 기본 어휘에 넣으면 어휘 재설정 멈춤이 줄어듦)
+    s["extra_words_top"] = dict(detector.word_requests.most_common(20))
+    s["vocab_stall_ms_total"] = ms(detector.stall_clock())
     s["csv_file"] = str(csv_log.path) if csv_log else None
     return s
 
@@ -1402,9 +1536,11 @@ async def detect(
             raise ApiError(429, "rate_limited", f"요청이 너무 잦습니다 (초당 최대 {DETECT_RATE_PER_SEC}회).",
                            headers={"Retry-After": str(max(1, round(retry)))})
         if detector.pending >= MAX_QUEUE:
-            raise ApiError(503, "queue_full", "요청이 많아 지금은 처리할 수 없습니다. 기기 내 인식을 사용하세요.")
+            raise ApiError(503, "queue_full", "요청이 많아 이번 사진은 처리하지 못했습니다. 잠시 후 다시 보내 주세요.",
+                           headers=RETRY_SOON)
 
-        vocab_ms = 0.0
+        vocab_ms = 0.0  # 어휘 추가는 백그라운드로 옮겨서 요청이 기다리지 않음 (항목은 호환을 위해 유지)
+        vocab_pending: list[str] = []
         # 별칭·동의어로 바꾸기 전의 원래 요청 목록 (색상 단어를 잃지 않도록 색 검증에는 이것을 씀)
         raw_targets = [" ".join(p.strip().lower().split()) for p in targets.split(",") if p.strip()]
         req_color = extract_color_from_targets(raw_targets) if mode == "targets" else None
@@ -1419,10 +1555,23 @@ async def detect(
                 detect_names = ",".join(strip_color_words(t) for t in raw_targets)
             requested = parse_targets(detect_names, set(detector.name_to_id))
             label_to_target, max_results = expand_targets(requested), None
-            if detector.missing_words(label_to_target):
-                vocab_ms = await run_in_threadpool(detector.ensure_words, list(label_to_target))
-            else:
-                detector.touch(label_to_target)
+            missing = detector.missing_words(label_to_target)
+            if missing:
+                known = detector.name_to_id
+                for w in missing:
+                    tgt = label_to_target.pop(w)
+                    alt = vocab_fallback(w, known)
+                    if alt:  # 뒷부분이 어휘에 있으면 그 이름으로 찾음 (어휘 추가 없음)
+                        for m in [alt] + _SYNONYM_INDEX.get(alt, []):
+                            if m in known:
+                                label_to_target.setdefault(m, tgt)
+                    else:
+                        vocab_pending.append(w)
+                if vocab_pending:
+                    detector.request_words(vocab_pending)  # 이 요청은 기다리지 않음
+            # 기본 어휘 밖 단어의 요청 횟수 (자주 나오면 vocab.py 기본 어휘에 넣을 후보, /stats 에 표시)
+            detector.word_requests.update(w for w in requested if w not in BASE_VOCAB)
+            detector.touch(label_to_target)
 
         t0 = time.perf_counter()
         img = await run_in_threadpool(decode_image, await image.read())
@@ -1433,9 +1582,11 @@ async def detect(
         job = Job(img, label_to_target, conf, imgsz, time.perf_counter(), loop.create_future(), loop, max_results, mode)
         detector.submit(job)
         try:
-            out = await asyncio.wait_for(job.future, timeout=REQUEST_TIMEOUT + 2.0)
+            # 마지막 안전장치 (보통은 배치 스레드가 REQUEST_TIMEOUT 기준으로 먼저 503을 돌려줌.
+            #  어휘 재설정으로 멈춘 시간은 그 기준에서 빠지므로 여유를 크게 둠)
+            out = await asyncio.wait_for(job.future, timeout=REQUEST_TIMEOUT + 10.0)
         except asyncio.TimeoutError:
-            raise ApiError(503, "timeout", "처리 시간이 너무 길어졌습니다. 기기 내 인식을 사용하세요.")
+            raise ApiError(503, "timeout", "처리 시간이 너무 길어졌습니다. 다음 사진을 보내 주세요.", headers=RETRY_SOON)
 
         # 추론·동의어·중복 박스 정리가 끝난 결과에 색 필터 (색 요청이 없으면 그대로 통과)
         detections, color_rejected, color_filter, color_ms = out["detections"], [], None, 0.0
@@ -1465,6 +1616,7 @@ async def detect(
             "detections": detections,
             "color_filter": color_filter,
             "color_rejected": color_rejected,
+            "vocab_pending": vocab_pending,
             "timing_ms": timing,
             "batch_size": out["batch_size"],
             "device": detector.device,
@@ -1555,7 +1707,7 @@ async def parse(request: Request, body: ParseRequest):
         if len(key) > PARSE_MAX_CHARS:
             raise ApiError(400, "invalid_text", f"text 는 {PARSE_MAX_CHARS}자 이내여야 합니다.")
 
-        result = parse_cache.get(key)
+        result = None if body.refresh else parse_cache.get(key)
         cached, attempts, vlm_ms = result is not None, 0, 0.0
         if result is None:
             fut = parse_cache.inflight.get(key)
@@ -1579,6 +1731,8 @@ async def parse(request: Request, body: ParseRequest):
                     parse_cache.inflight.pop(key, None)
                 vlm_ms = ms(time.perf_counter() - t1)
 
+        # 잡았다는 말이면 grabbed: true (앱은 "멈춤"이 아니라 "완료"로 처리)
+        result = {**result, "grabbed": result["intent"] == "stop" and bool(GRAB_RE.search(key))}
         total = ms(time.perf_counter() - t_start)
         # CSV에는 음성 문장 대신 해석 결과만 남김
         record("parse", 200, "cached" if cached else "ok", t_start, ip, cid,
@@ -1600,10 +1754,6 @@ async def tts(request: Request, body: TtsRequest):
             raise ApiError(503, "tts_disabled", f"음성 설정이 잘못되었습니다: {tts_cfg_error}")
         if not tts_cfg.enabled:
             raise ApiError(503, "tts_disabled", "서버에 ELEVENLABS_API_KEY 또는 ELEVENLABS_VOICE_ID 가 설정되지 않았습니다.")
-        allowed, retry = tts_limiter.allow(f"cid:{cid}" if cid else f"ip:{ip}")
-        if not allowed:
-            raise ApiError(429, "rate_limited", f"음성 요청이 너무 잦습니다 (분당 최대 {TTS_RATE_PER_MIN}회).",
-                           headers={"Retry-After": str(max(1, round(retry)))})
         if not text:
             raise ApiError(400, "invalid_text", "text 가 비어 있습니다.")
         if len(text) > TTS_MAX_CHARS:
@@ -1616,7 +1766,7 @@ async def tts(request: Request, body: TtsRequest):
         # 1) 저장된 파일이 있으면 그대로 (하루 상한과 무관)
         if path.is_file() and path.stat().st_size > 0:
             record("tts", 200, "cache", t_start, ip, cid, **row)
-            return tts_audio_response(path, "cache", 0)
+            return tts_audio_response(path, "cache", 0, key)
 
         # 2) 같은 문장을 지금 만드는 중이면 그 결과를 기다림 (글자 수를 두 번 쓰지 않음)
         fut = _tts_inflight.get(key)
@@ -1624,9 +1774,14 @@ async def tts(request: Request, body: TtsRequest):
             audio = await asyncio.shield(fut)
             gen_ms = ms(time.perf_counter() - t_start)
             record("tts", 200, "generated", t_start, ip, cid, inference_ms=gen_ms, **row)
-            return tts_audio_response(audio, "generated", gen_ms)
+            return tts_audio_response(audio, "generated", gen_ms, key)
 
-        # 3) 새로 생성: 하루 글자 수를 먼저 잡아둠
+        # 3) 새로 생성. 분당 제한은 생성할 때만 셈 (저장된 문장은 몇 번을 들어도 제한 없음)
+        allowed, retry = tts_limiter.allow(f"cid:{cid}" if cid else f"ip:{ip}")
+        if not allowed:
+            raise ApiError(429, "rate_limited", f"새 음성 생성 요청이 너무 잦습니다 (분당 최대 {TTS_RATE_PER_MIN}회).",
+                           headers={"Retry-After": str(max(1, round(retry)))})
+        # 하루 글자 수를 먼저 잡아둠
         if not tts_usage.reserve(len(text)):
             raise ApiError(
                 429, "tts_daily_limit",
@@ -1661,7 +1816,7 @@ async def tts(request: Request, body: TtsRequest):
 
         log.info("tts 생성 %d자 %.0fms (오늘 %d/%d자)", len(text), gen_ms, tts_usage.used(), TTS_DAILY_CHAR_LIMIT)
         record("tts", 200, "generated", t_start, ip, cid, inference_ms=gen_ms, **row)
-        return tts_audio_response(audio, "generated", gen_ms)
+        return tts_audio_response(audio, "generated", gen_ms, key)
     except ApiError as e:
         record("tts", e.status, e.code, t_start, ip, cid, **row)
         raise
